@@ -45,9 +45,42 @@ Actions for the target repositories.
 | `GITHUB_REPO` | Default repository so tools can omit `repo` (e.g. `drops`) |
 | `GITHUB_API_URL` | Optional GitHub Enterprise API base URL |
 | `GITHUB_ENABLE_DANGEROUS` | Set `true` to enable destructive tools (`deletePullRequestTask`) |
+| `GITHUB_COMMENT_SIGNATURE` | Optional auto-appended comment signature (see below) |
 | `GITHUB_MCP_LOG_DISABLE` / `GITHUB_MCP_LOG_FILE` / `GITHUB_MCP_LOG_DIR` / `GITHUB_MCP_LOG_PER_CWD` | File-logging controls (logs default to the platform log directory, never the CWD) |
 
-See `.env.example` for a starter configuration.
+Variables are read from `process.env` and, as a fallback, from a gitignored
+`.env` file in the project root. `process.env` always takes precedence; `.env`
+only fills in variables that are otherwise unset. See `.env.example` for a
+starter configuration.
+
+#### Comment signature
+
+When `GITHUB_COMMENT_SIGNATURE` is set and non-empty, the server appends it to
+the body of comments it posts. The value is appended verbatim after two
+newlines, so the signature itself carries any decoration (dash, emoji, etc.) —
+nothing is hardcoded. A generic example value:
+
+```
+GITHUB_COMMENT_SIGNATURE=🤖 via Example MCP bot
+```
+
+It applies to:
+
+- `addPullRequestComment` — top-level, inline, and reply bodies.
+- `createPullRequestReview` — the top-level review summary `body` only (never
+  the inline `comments[]`).
+- `submitPullRequestReview` — the `body`, when one is provided.
+
+It does **not** apply to:
+
+- `addCommentToPendingReview` — these are inline drafts within a batch; the
+  eventual review body carries the signature instead.
+- Any other tool.
+
+Appending is idempotent: if a body already ends with the signature (trimmed
+compare), it is not appended again. Leaving the variable unset or empty is a
+no-op. The signature is body text only — GitHub still attributes the comment to
+the authenticated token account.
 
 ### Claude Code registration
 
@@ -261,6 +294,8 @@ credentials or network.
 - `src/codeowners.ts` — CODEOWNERS parsing.
 - `src/pendingReview.ts` — pending-review resolution and review-comment
   draft validation for review batching.
+- `src/signature.ts` — optional comment-signature appending and the `.env`
+  loader.
 
 ## License
 

@@ -12,6 +12,7 @@ import winston from "winston";
 import os from "os";
 import path from "path";
 import fs from "fs";
+import { fileURLToPath } from "url";
 import {
   GitHubPaginator,
   GITHUB_ALL_ITEMS_CAP,
@@ -49,6 +50,11 @@ import {
   ReviewCommentDraft,
   validateReviewCommentDrafts,
 } from "./pendingReview.js";
+import { applySignature, loadDotEnv } from "./signature.js";
+
+// Load a gitignored `.env` from the project root before any process.env reads.
+// process.env always wins; `.env` only fills in unset variables.
+loadDotEnv(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", ".env"));
 
 // =========== LOGGER SETUP ==========
 // File-based logging with sensible defaults and ability to disable
@@ -2473,6 +2479,8 @@ class GitHubServer {
     comments?: ReviewCommentDraft[]
   ) {
     const ctx = this.resolveContext(owner, repo);
+    // Sign the top-level review summary only; never the inline comments[].
+    body = applySignature(body);
     return this.guard(
       "createPullRequestReview",
       { ...ctx, pull_number, event, comment_count: comments?.length ?? 0 },
@@ -2723,6 +2731,7 @@ class GitHubServer {
     review_id?: number
   ) {
     const ctx = this.resolveContext(owner, repo);
+    body = applySignature(body);
     return this.guard(
       "submitPullRequestReview",
       { ...ctx, pull_number, event, review_id },
@@ -3093,6 +3102,7 @@ class GitHubServer {
     } = {}
   ) {
     const ctx = this.resolveContext(owner, repo);
+    body = applySignature(body) ?? body;
     return this.guard(
       "addPullRequestComment",
       { ...ctx, pull_number, ...options },
