@@ -5,9 +5,10 @@ built as a sibling of [bitbucket-mcp](https://github.com/MatanYemini/bitbucket-m
 the same single-server architecture, pagination model, log shaping, and tool
 vocabulary, mapped onto GitHub.
 
-Covers pull requests, reviews, comments and threads, diffs, commit statuses
-and check runs, GitHub Actions (workflows, runs, jobs, logs), branch
-protection, and CODEOWNERS.
+Exposes 48 tools by default (49 total — `deletePullRequestTask` is gated
+behind `GITHUB_ENABLE_DANGEROUS`) covering pull requests, reviews, comments
+and threads, diffs, commit statuses and check runs, GitHub Actions
+(workflows, runs, jobs, logs), branch protection, and CODEOWNERS.
 
 ## Setup
 
@@ -41,8 +42,8 @@ Actions for the target repositories.
 | Variable | Description |
 |----------|-------------|
 | `GITHUB_TOKEN` | Token (falls back to `gh auth token`) |
-| `GITHUB_OWNER` | Default owner so tools can omit `owner` (e.g. `hii-inc-sebu`) |
-| `GITHUB_REPO` | Default repository so tools can omit `repo` (e.g. `drops`) |
+| `GITHUB_OWNER` | Default owner so tools can omit `owner` (e.g. `your-org` or `octocat`) |
+| `GITHUB_REPO` | Default repository so tools can omit `repo` (e.g. `your-repo` or `Hello-World`) |
 | `GITHUB_API_URL` | Optional GitHub Enterprise API base URL |
 | `GITHUB_ENABLE_DANGEROUS` | Set `true` to enable destructive tools (`deletePullRequestTask`) |
 | `GITHUB_COMMENT_SIGNATURE` | Optional auto-appended comment signature (see below) |
@@ -85,11 +86,15 @@ the authenticated token account.
 ### Claude Code registration
 
 ```bash
-claude mcp add github -- node /path/to/github-mcp/dist/index.js \
+claude mcp add github \
   --env GITHUB_TOKEN=<your-token> \
   --env GITHUB_OWNER=<default-owner> \
-  --env GITHUB_REPO=<default-repo>
+  --env GITHUB_REPO=<default-repo> \
+  -- node /path/to/github-mcp/dist/index.js
 ```
+
+The `--env` flags must come before the `--` separator; everything after `--`
+is the command the server runs.
 
 Or in `mcpServers` JSON form:
 

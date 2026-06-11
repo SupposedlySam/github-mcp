@@ -25,9 +25,8 @@ dist-tests/
 *.tsbuildinfo
 
 # Environment
-.env
-.env.local
-.env.*.local
+.env*
+!.env.example
 
 # Editor
 .vscode/
