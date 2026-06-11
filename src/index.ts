@@ -42,6 +42,13 @@ import {
   ThreadComment,
 } from "./threads.js";
 import { CODEOWNERS_LOCATIONS, parseCodeowners } from "./codeowners.js";
+import {
+  describePendingReviewFailure,
+  PendingReviewCandidate,
+  resolvePendingReview,
+  ReviewCommentDraft,
+  validateReviewCommentDrafts,
+} from "./pendingReview.js";
 
 // =========== LOGGER SETUP ==========
 // File-based logging with sensible defaults and ability to disable
@@ -365,6 +372,30 @@ const CONVERT_TO_DRAFT_MUTATION = `
   mutation ConvertToDraft($pullRequestId: ID!) {
     convertPullRequestToDraft(input: { pullRequestId: $pullRequestId }) {
       pullRequest { number isDraft }
+    }
+  }
+`;
+
+const ADD_REVIEW_THREAD_MUTATION = `
+  mutation AddReviewThread($input: AddPullRequestReviewThreadInput!) {
+    addPullRequestReviewThread(input: $input) {
+      thread {
+        id
+        path
+        line
+        startLine
+        comments(first: 1) {
+          nodes { databaseId body state }
+        }
+      }
+    }
+  }
+`;
+
+const ADD_REVIEW_THREAD_REPLY_MUTATION = `
+  mutation AddReviewThreadReply($input: AddPullRequestReviewThreadReplyInput!) {
+    addPullRequestReviewThreadReply(input: $input) {
+      comment { databaseId body path state }
     }
   }
 `;
@@ -733,6 +764,178 @@ class GitHubServer {
                 type: "string",
                 description:
                   "Dismissal message (defaults to 'Approval withdrawn')",
+              },
+            },
+            required: ["pull_number"],
+          },
+        },
+        {
+          name: "createPullRequestReview",
+          description:
+            "Create a pull request review, optionally with multiple inline comments, published as ONE review (a single notification) instead of separate immediate comments. With `event` set the review is published in one shot; with `event` omitted the review is created PENDING (a draft, invisible to everyone else) for later submitPullRequestReview.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              ...OWNER_REPO_SCHEMA,
+              pull_number: PULL_NUMBER_SCHEMA,
+              body: {
+                type: "string",
+                description:
+                  "Optional overall review summary (required by GitHub when event is COMMENT or REQUEST_CHANGES)",
+              },
+              event: {
+                type: "string",
+                enum: ["COMMENT", "APPROVE", "REQUEST_CHANGES"],
+                description:
+                  "Review action. When omitted, the review is created PENDING and must be submitted later with submitPullRequestReview.",
+              },
+              commit_id: {
+                type: "string",
+                description:
+                  "Commit SHA to anchor the review to (defaults to the PR head)",
+              },
+              comments: {
+                type: "array",
+                description:
+                  "Inline comments to include in the review, each anchored to a diff line",
+                items: {
+                  type: "object",
+                  properties: {
+                    path: {
+                      type: "string",
+                      description: "File path the comment applies to",
+                    },
+                    body: {
+                      type: "string",
+                      description: "Comment text (markdown)",
+                    },
+                    line: {
+                      type: "number",
+                      description:
+                        "Line number in the diff (the end of the range for multi-line comments)",
+                    },
+                    side: {
+                      type: "string",
+                      enum: ["LEFT", "RIGHT"],
+                      description:
+                        "LEFT for deletions (old file), RIGHT for additions/context (new file). Defaults to RIGHT.",
+                    },
+                    start_line: {
+                      type: "number",
+                      description:
+                        "Multi-line mode: first line of the range (must be <= line)",
+                    },
+                    start_side: {
+                      type: "string",
+                      enum: ["LEFT", "RIGHT"],
+                      description: "Multi-line mode: side of start_line",
+                    },
+                  },
+                  required: ["path", "body", "line"],
+                },
+              },
+            },
+            required: ["pull_number"],
+          },
+        },
+        {
+          name: "getPendingReview",
+          description:
+            "Get the authenticated user's pending (draft) review on a pull request, including its draft comments. Pending reviews are visible only to the account that owns them, so when that account differs from the one used in the browser this tool is the only way to inspect drafts before submitting.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              ...OWNER_REPO_SCHEMA,
+              pull_number: PULL_NUMBER_SCHEMA,
+            },
+            required: ["pull_number"],
+          },
+        },
+        {
+          name: "addCommentToPendingReview",
+          description:
+            "Add a single draft comment to the authenticated user's existing pending review (GraphQL addPullRequestReviewThread). Two modes: new inline thread (body + path + line) or a reply to an existing review comment thread (body + in_reply_to). Fails if no pending review exists; start one with createPullRequestReview (omit event).",
+          inputSchema: {
+            type: "object",
+            properties: {
+              ...OWNER_REPO_SCHEMA,
+              pull_number: PULL_NUMBER_SCHEMA,
+              body: { type: "string", description: "Comment text (markdown)" },
+              path: {
+                type: "string",
+                description: "Inline mode: file path the comment applies to",
+              },
+              line: {
+                type: "number",
+                description:
+                  "Inline mode: line number in the diff (the end of the range for multi-line comments)",
+              },
+              side: {
+                type: "string",
+                enum: ["LEFT", "RIGHT"],
+                description:
+                  "Inline mode: LEFT for deletions (old file), RIGHT for additions/context (new file). Defaults to RIGHT.",
+              },
+              start_line: {
+                type: "number",
+                description:
+                  "Inline multi-line mode: first line of the range (must be <= line)",
+              },
+              start_side: {
+                type: "string",
+                enum: ["LEFT", "RIGHT"],
+                description: "Inline multi-line mode: side of start_line",
+              },
+              in_reply_to: {
+                type: "number",
+                description:
+                  "Reply mode: id of an existing review comment; the draft reply is added to that comment's thread",
+              },
+            },
+            required: ["pull_number", "body"],
+          },
+        },
+        {
+          name: "submitPullRequestReview",
+          description:
+            "Submit (publish) a pending review, sending all of its draft comments as one review with a single notification. When review_id is omitted, the authenticated user's pending review on the PR is resolved automatically.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              ...OWNER_REPO_SCHEMA,
+              pull_number: PULL_NUMBER_SCHEMA,
+              event: {
+                type: "string",
+                enum: ["COMMENT", "APPROVE", "REQUEST_CHANGES"],
+                description: "Review action to publish the pending review as",
+              },
+              body: {
+                type: "string",
+                description:
+                  "Optional overall review summary (required by GitHub when event is COMMENT or REQUEST_CHANGES)",
+              },
+              review_id: {
+                type: "number",
+                description:
+                  "Pending review id (defaults to the authenticated user's pending review on the PR)",
+              },
+            },
+            required: ["pull_number", "event"],
+          },
+        },
+        {
+          name: "deletePendingReview",
+          description:
+            "Discard a pending (draft) review and its draft comments without publishing anything. Only works on PENDING reviews; GitHub rejects deleting submitted ones. When review_id is omitted, the authenticated user's pending review on the PR is resolved automatically.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              ...OWNER_REPO_SCHEMA,
+              pull_number: PULL_NUMBER_SCHEMA,
+              review_id: {
+                type: "number",
+                description:
+                  "Pending review id (defaults to the authenticated user's pending review on the PR)",
               },
             },
             required: ["pull_number"],
@@ -1478,6 +1681,57 @@ class GitHubServer {
               args.pull_number as number,
               args.message as string | undefined
             );
+          case "createPullRequestReview":
+            return await this.createPullRequestReview(
+              args.owner as string | undefined,
+              args.repo as string | undefined,
+              args.pull_number as number,
+              args.body as string | undefined,
+              args.event as
+                | "COMMENT"
+                | "APPROVE"
+                | "REQUEST_CHANGES"
+                | undefined,
+              args.commit_id as string | undefined,
+              args.comments as ReviewCommentDraft[] | undefined
+            );
+          case "getPendingReview":
+            return await this.getPendingReview(
+              args.owner as string | undefined,
+              args.repo as string | undefined,
+              args.pull_number as number
+            );
+          case "addCommentToPendingReview":
+            return await this.addCommentToPendingReview(
+              args.owner as string | undefined,
+              args.repo as string | undefined,
+              args.pull_number as number,
+              args.body as string,
+              {
+                path: args.path as string | undefined,
+                line: args.line as number | undefined,
+                side: args.side as "LEFT" | "RIGHT" | undefined,
+                start_line: args.start_line as number | undefined,
+                start_side: args.start_side as "LEFT" | "RIGHT" | undefined,
+                in_reply_to: args.in_reply_to as number | undefined,
+              }
+            );
+          case "submitPullRequestReview":
+            return await this.submitPullRequestReview(
+              args.owner as string | undefined,
+              args.repo as string | undefined,
+              args.pull_number as number,
+              args.event as "COMMENT" | "APPROVE" | "REQUEST_CHANGES",
+              args.body as string | undefined,
+              args.review_id as number | undefined
+            );
+          case "deletePendingReview":
+            return await this.deletePendingReview(
+              args.owner as string | undefined,
+              args.repo as string | undefined,
+              args.pull_number as number,
+              args.review_id as number | undefined
+            );
           case "getPendingReviewPRs":
             return await this.getPendingReviewPRs(
               args.owner as string | undefined,
@@ -2131,21 +2385,13 @@ class GitHubServer {
       { ...ctx, pull_number },
       async () => {
         const login = await this.getAuthenticatedLogin();
-        const reviews = await this.paginator.fetchValues<any>(
-          async (p, pp) =>
-            (
-              await this.octokit.rest.pulls.listReviews({
-                owner: ctx.owner,
-                repo: ctx.repo,
-                pull_number,
-                per_page: pp,
-                page: p,
-              })
-            ).data,
-          { all: true, per_page: 100, description: "listReviews" }
+        const reviews = await this.listAllReviews(
+          ctx.owner,
+          ctx.repo,
+          pull_number
         );
 
-        const myApprovals = reviews.values.filter(
+        const myApprovals = reviews.filter(
           (review: any) =>
             review.user?.login === login && review.state === "APPROVED"
         );
@@ -2168,6 +2414,380 @@ class GitHubServer {
           dismissed_review_id: latest.id,
           state: response.data.state,
         });
+      }
+    );
+  }
+
+  // =========== REVIEW BATCHING METHODS ===========
+
+  /** Fetch every review on a pull request (all pages). */
+  private async listAllReviews(
+    owner: string,
+    repo: string,
+    pull_number: number
+  ): Promise<any[]> {
+    const result = await this.paginator.fetchValues<any>(
+      async (p, pp) =>
+        (
+          await this.octokit.rest.pulls.listReviews({
+            owner,
+            repo,
+            pull_number,
+            per_page: pp,
+            page: p,
+          })
+        ).data,
+      { all: true, per_page: 100, description: "listReviews" }
+    );
+    return result.values;
+  }
+
+  /**
+   * Resolve the authenticated user's single pending review on a PR, throwing
+   * an InvalidParams error when none exists or the lookup is ambiguous.
+   */
+  private async requirePendingReview(
+    owner: string,
+    repo: string,
+    pull_number: number
+  ): Promise<PendingReviewCandidate> {
+    const login = await this.getAuthenticatedLogin();
+    const reviews = await this.listAllReviews(owner, repo, pull_number);
+    const resolution = resolvePendingReview(reviews, login);
+    if (resolution.kind !== "found") {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        describePendingReviewFailure(resolution, login, pull_number)
+      );
+    }
+    return resolution.review;
+  }
+
+  async createPullRequestReview(
+    owner: string | undefined,
+    repo: string | undefined,
+    pull_number: number,
+    body?: string,
+    event?: "COMMENT" | "APPROVE" | "REQUEST_CHANGES",
+    commit_id?: string,
+    comments?: ReviewCommentDraft[]
+  ) {
+    const ctx = this.resolveContext(owner, repo);
+    return this.guard(
+      "createPullRequestReview",
+      { ...ctx, pull_number, event, comment_count: comments?.length ?? 0 },
+      async () => {
+        if (comments && comments.length > 0) {
+          const problems = validateReviewCommentDrafts(comments);
+          if (problems.length > 0) {
+            throw new McpError(
+              ErrorCode.InvalidParams,
+              `Invalid review comments: ${problems.join("; ")}`
+            );
+          }
+        }
+        const response = await this.octokit.rest.pulls.createReview({
+          owner: ctx.owner,
+          repo: ctx.repo,
+          pull_number,
+          ...(body !== undefined ? { body } : {}),
+          ...(event !== undefined ? { event } : {}),
+          ...(commit_id !== undefined ? { commit_id } : {}),
+          ...(comments && comments.length > 0
+            ? {
+                comments: comments.map((comment) => ({
+                  path: comment.path,
+                  body: comment.body,
+                  line: comment.line,
+                  side: comment.side ?? "RIGHT",
+                  ...(comment.start_line !== undefined
+                    ? {
+                        start_line: comment.start_line,
+                        start_side:
+                          comment.start_side ?? comment.side ?? "RIGHT",
+                      }
+                    : {}),
+                })),
+              }
+            : {}),
+        });
+        const state = response.data.state;
+        return this.json({
+          review_id: response.data.id,
+          state,
+          pending: state === "PENDING",
+          author: response.data.user?.login,
+          submitted_at: response.data.submitted_at,
+          comment_count: comments?.length ?? 0,
+          html_url: response.data.html_url,
+          ...(state === "PENDING"
+            ? {
+                note: "Review is an unpublished draft. Add comments with addCommentToPendingReview, publish with submitPullRequestReview, or discard with deletePendingReview.",
+              }
+            : {}),
+        });
+      }
+    );
+  }
+
+  async getPendingReview(
+    owner: string | undefined,
+    repo: string | undefined,
+    pull_number: number
+  ) {
+    const ctx = this.resolveContext(owner, repo);
+    return this.guard(
+      "getPendingReview",
+      { ...ctx, pull_number },
+      async () => {
+        const login = await this.getAuthenticatedLogin();
+        const reviews = await this.listAllReviews(
+          ctx.owner,
+          ctx.repo,
+          pull_number
+        );
+        const resolution = resolvePendingReview(reviews, login);
+        if (resolution.kind === "none") {
+          return this.json({
+            pending_review: null,
+            message: describePendingReviewFailure(
+              resolution,
+              login,
+              pull_number
+            ),
+          });
+        }
+        if (resolution.kind === "ambiguous") {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            describePendingReviewFailure(resolution, login, pull_number)
+          );
+        }
+
+        const review = resolution.review;
+        const comments = await this.paginator.fetchValues<any>(
+          async (p, pp) =>
+            (
+              await this.octokit.rest.pulls.listCommentsForReview({
+                owner: ctx.owner,
+                repo: ctx.repo,
+                pull_number,
+                review_id: review.id,
+                per_page: pp,
+                page: p,
+              })
+            ).data,
+          { all: true, per_page: 100, description: "listCommentsForReview" }
+        );
+
+        return this.json({
+          pending_review: {
+            review_id: review.id,
+            node_id: review.node_id,
+            author: login,
+            state: "PENDING",
+            body: review.body || undefined,
+            commit_id: review.commit_id,
+            html_url: review.html_url,
+            comment_count: comments.values.length,
+            comments: comments.values.map((comment: any) => ({
+              id: comment.id,
+              path: comment.path,
+              line: comment.line ?? comment.original_line,
+              start_line: comment.start_line ?? comment.original_start_line,
+              side: comment.side,
+              start_side: comment.start_side,
+              in_reply_to_id: comment.in_reply_to_id,
+              body: comment.body,
+            })),
+          },
+        });
+      }
+    );
+  }
+
+  async addCommentToPendingReview(
+    owner: string | undefined,
+    repo: string | undefined,
+    pull_number: number,
+    body: string,
+    options: {
+      path?: string;
+      line?: number;
+      side?: "LEFT" | "RIGHT";
+      start_line?: number;
+      start_side?: "LEFT" | "RIGHT";
+      in_reply_to?: number;
+    } = {}
+  ) {
+    const ctx = this.resolveContext(owner, repo);
+    return this.guard(
+      "addCommentToPendingReview",
+      { ...ctx, pull_number, ...options },
+      async () => {
+        const review = await this.requirePendingReview(
+          ctx.owner,
+          ctx.repo,
+          pull_number
+        );
+        if (!review.node_id) {
+          throw new McpError(
+            ErrorCode.InternalError,
+            `Pending review ${review.id} has no GraphQL node id`
+          );
+        }
+
+        // Reply mode: a draft reply on an existing review-comment thread.
+        if (options.in_reply_to !== undefined) {
+          const threadMap = await this.fetchReviewThreadMap(
+            ctx.owner,
+            ctx.repo,
+            pull_number
+          );
+          const entry = threadMap.get(options.in_reply_to);
+          if (!entry) {
+            throw new McpError(
+              ErrorCode.InvalidParams,
+              `No review thread found containing comment ${options.in_reply_to} on PR #${pull_number}`
+            );
+          }
+          const response: any = await this.octokit.graphql(
+            ADD_REVIEW_THREAD_REPLY_MUTATION,
+            {
+              input: {
+                pullRequestReviewId: review.node_id,
+                pullRequestReviewThreadId: entry.threadId,
+                body,
+              },
+            }
+          );
+          const comment = response?.addPullRequestReviewThreadReply?.comment;
+          return this.json({
+            mode: "reply",
+            review_id: review.id,
+            comment_id: comment?.databaseId,
+            path: comment?.path,
+            state: comment?.state,
+            body: comment?.body,
+          });
+        }
+
+        // Inline mode: a new draft thread on a diff line.
+        if (options.path === undefined || options.line === undefined) {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            "addCommentToPendingReview requires path and line (new thread) or in_reply_to (reply)"
+          );
+        }
+        const response: any = await this.octokit.graphql(
+          ADD_REVIEW_THREAD_MUTATION,
+          {
+            input: {
+              pullRequestReviewId: review.node_id,
+              path: options.path,
+              line: options.line,
+              side: options.side ?? "RIGHT",
+              ...(options.start_line !== undefined
+                ? {
+                    startLine: options.start_line,
+                    startSide: options.start_side ?? options.side ?? "RIGHT",
+                  }
+                : {}),
+              body,
+            },
+          }
+        );
+        const thread = response?.addPullRequestReviewThread?.thread;
+        const comment = thread?.comments?.nodes?.[0];
+        return this.json({
+          mode: "inline",
+          review_id: review.id,
+          thread_id: thread?.id,
+          comment_id: comment?.databaseId,
+          path: thread?.path,
+          line: thread?.line,
+          start_line: thread?.startLine,
+          state: comment?.state,
+          body: comment?.body,
+        });
+      }
+    );
+  }
+
+  async submitPullRequestReview(
+    owner: string | undefined,
+    repo: string | undefined,
+    pull_number: number,
+    event: "COMMENT" | "APPROVE" | "REQUEST_CHANGES",
+    body?: string,
+    review_id?: number
+  ) {
+    const ctx = this.resolveContext(owner, repo);
+    return this.guard(
+      "submitPullRequestReview",
+      { ...ctx, pull_number, event, review_id },
+      async () => {
+        const resolvedId =
+          review_id ??
+          (await this.requirePendingReview(ctx.owner, ctx.repo, pull_number))
+            .id;
+        const response = await this.octokit.rest.pulls.submitReview({
+          owner: ctx.owner,
+          repo: ctx.repo,
+          pull_number,
+          review_id: resolvedId,
+          event,
+          ...(body !== undefined ? { body } : {}),
+        });
+        return this.json({
+          review_id: response.data.id,
+          state: response.data.state,
+          author: response.data.user?.login,
+          submitted_at: response.data.submitted_at,
+          html_url: response.data.html_url,
+        });
+      }
+    );
+  }
+
+  async deletePendingReview(
+    owner: string | undefined,
+    repo: string | undefined,
+    pull_number: number,
+    review_id?: number
+  ) {
+    const ctx = this.resolveContext(owner, repo);
+    return this.guard(
+      "deletePendingReview",
+      { ...ctx, pull_number, review_id },
+      async () => {
+        const resolvedId =
+          review_id ??
+          (await this.requirePendingReview(ctx.owner, ctx.repo, pull_number))
+            .id;
+        try {
+          const response = await this.octokit.rest.pulls.deletePendingReview({
+            owner: ctx.owner,
+            repo: ctx.repo,
+            pull_number,
+            review_id: resolvedId,
+          });
+          return this.json({
+            deleted_review_id: resolvedId,
+            state: response.data.state,
+          });
+        } catch (error) {
+          if (isRequestError(error) && error.status === 422) {
+            throw new McpError(
+              ErrorCode.InvalidParams,
+              formatGitHubError(
+                error,
+                `Review ${resolvedId} could not be deleted (only PENDING reviews can be deleted; submitted reviews cannot)`
+              )
+            );
+          }
+          throw error;
+        }
       }
     );
   }

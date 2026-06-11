@@ -40,6 +40,7 @@ Adding a tool means touching all three.
 - `src/diffChunks.ts` — unified-diff hunk extraction
 - `src/threads.ts` — comment thread building (in_reply_to_id chains) and new-reply detection
 - `src/codeowners.ts` — CODEOWNERS parsing
+- `src/pendingReview.ts` — pending-review resolution and review-comment draft validation (review batching)
 
 Repetitive data processing belongs in these modules (code over compute), keeping it testable without network access.
 

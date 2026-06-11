@@ -121,6 +121,49 @@ Every tool accepts optional `owner`/`repo` (defaulting to
 | `reopenComment` | `reopenComment` | GraphQL `unresolveReviewThread` |
 | `checkPrReplies` | `checkPrReplies` | Finds threads with replies newer than your last comment; identity defaults to the authenticated user's login |
 
+### Review batching
+
+These tools post multiple review comments as **one review** — the PR author
+gets a single notification email instead of one per comment. They have no
+Bitbucket equivalent (Bitbucket has no review object).
+
+| Tool | Notes |
+|------|-------|
+| `createPullRequestReview` | One-shot publish (`event` set) or start a pending review (`event` omitted); accepts a `comments` array of inline comments |
+| `getPendingReview` | Your pending review plus its draft comments (path, line, body) |
+| `addCommentToPendingReview` | Add one draft comment to the pending review: new thread (`path`+`line`) or reply (`in_reply_to`); GraphQL `addPullRequestReviewThread` / `addPullRequestReviewThreadReply` |
+| `submitPullRequestReview` | Publish the pending review as `COMMENT` / `APPROVE` / `REQUEST_CHANGES` |
+| `deletePendingReview` | Discard the pending review and its drafts (GitHub only allows deleting PENDING reviews) |
+
+`submitPullRequestReview` and `deletePendingReview` take an optional
+`review_id`; when omitted they resolve the authenticated user's single
+pending review on the PR automatically and fail with a clear message when
+there is none.
+
+**One-shot flow** — when the full comment set is known up front, send it
+atomically:
+
+1. `createPullRequestReview` with `event` (`COMMENT`, `APPROVE`, or
+   `REQUEST_CHANGES`), an optional summary `body`, and the `comments` array.
+   The review publishes immediately as a single review.
+
+**Pending flow** — when comments accumulate while working through a diff:
+
+1. `createPullRequestReview` with `event` omitted (optionally seeded with
+   initial `comments`) to start a PENDING draft review.
+2. `addCommentToPendingReview` for each additional comment (inline or
+   reply).
+3. `getPendingReview` to inspect the drafts.
+4. `submitPullRequestReview` to publish everything as one review, or
+   `deletePendingReview` to discard it without publishing.
+
+**Pending reviews are invisible to other accounts.** A pending review can
+only be seen by the account that created it. When the account behind the
+MCP token differs from the account a person uses in the browser (a common
+setup with bot or secondary accounts), drafts will not appear in the web UI
+at all — `getPendingReview` is the only way to inspect them before
+submitting.
+
 ### Tasks (emulated)
 
 GitHub has no native PR task object, so tasks are **emulated as a markdown
@@ -199,7 +242,8 @@ npm run inspector  # MCP inspector against the built server
 
 Unit tests cover the pure helper modules (pagination, search queries, task
 checklists, log filtering, diff chunking, thread building, CODEOWNERS
-parsing, token resolution) and run without any credentials or network.
+parsing, token resolution, pending-review resolution) and run without any
+credentials or network.
 
 ## Architecture
 
@@ -215,6 +259,8 @@ parsing, token resolution) and run without any credentials or network.
 - `src/diffChunks.ts` — unified-diff hunk extraction.
 - `src/threads.ts` — comment thread building and new-reply detection.
 - `src/codeowners.ts` — CODEOWNERS parsing.
+- `src/pendingReview.ts` — pending-review resolution and review-comment
+  draft validation for review batching.
 
 ## License
 
