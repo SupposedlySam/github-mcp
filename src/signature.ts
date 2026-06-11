@@ -33,6 +33,14 @@ export function getCommentSignature(
  * - Append format: existing body, two newlines, signature verbatim.
  */
 export function applySignature(
+  body: string,
+  env?: Record<string, string | undefined>
+): string;
+export function applySignature(
+  body: string | undefined,
+  env?: Record<string, string | undefined>
+): string | undefined;
+export function applySignature(
   body: string | undefined,
   env: Record<string, string | undefined> = process.env
 ): string | undefined {

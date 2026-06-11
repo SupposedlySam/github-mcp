@@ -51,6 +51,7 @@ import {
   validateReviewCommentDrafts,
 } from "./pendingReview.js";
 import { applySignature, loadDotEnv } from "./signature.js";
+import { planCommentMode } from "./commentMode.js";
 
 // Load a gitignored `.env` from the project root before any process.env reads.
 // process.env always wins; `.env` only fills in unset variables.
@@ -3102,19 +3103,25 @@ class GitHubServer {
     } = {}
   ) {
     const ctx = this.resolveContext(owner, repo);
-    body = applySignature(body) ?? body;
+    // Sign once, before mode dispatch, so every mode posts the signed body.
+    body = applySignature(body);
     return this.guard(
       "addPullRequestComment",
       { ...ctx, pull_number, ...options },
       async () => {
+        const plan = planCommentMode(options);
+        if ("error" in plan) {
+          throw new McpError(ErrorCode.InvalidParams, plan.error);
+        }
+
         // Reply mode: continue an existing review-comment thread.
-        if (options.in_reply_to !== undefined) {
+        if (plan.mode === "reply") {
           const response =
             await this.octokit.rest.pulls.createReplyForReviewComment({
               owner: ctx.owner,
               repo: ctx.repo,
               pull_number,
-              comment_id: options.in_reply_to,
+              comment_id: plan.in_reply_to,
               body,
             });
           return this.json({
@@ -3124,13 +3131,7 @@ class GitHubServer {
         }
 
         // Inline mode: comment on a diff line.
-        if (options.path !== undefined || options.line !== undefined) {
-          if (options.path === undefined || options.line === undefined) {
-            throw new McpError(
-              ErrorCode.InvalidParams,
-              "Inline comments require both path and line"
-            );
-          }
+        if (plan.mode === "inline") {
           let commitId = options.commit_id;
           if (!commitId) {
             const pr = await this.octokit.rest.pulls.get({
@@ -3146,14 +3147,13 @@ class GitHubServer {
             pull_number,
             body,
             commit_id: commitId,
-            path: options.path,
-            line: options.line,
-            side: options.side ?? "RIGHT",
-            ...(options.start_line !== undefined
+            path: plan.path,
+            line: plan.line,
+            side: plan.side,
+            ...(plan.start_line !== undefined
               ? {
-                  start_line: options.start_line,
-                  start_side:
-                    options.start_side ?? options.side ?? "RIGHT",
+                  start_line: plan.start_line,
+                  start_side: plan.start_side,
                 }
               : {}),
           });
