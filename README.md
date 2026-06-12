@@ -301,6 +301,9 @@ credentials or network.
   draft validation for review batching.
 - `src/signature.ts` — optional comment-signature appending and the `.env`
   loader.
+- `src/repoMove.ts` — renamed/transferred repository handling: recognizing
+  the content-length-mismatch failure GitHub's redirect causes on requests
+  with a body, and caching old-slug → new-slug mappings for retries.
 
 ## License
 

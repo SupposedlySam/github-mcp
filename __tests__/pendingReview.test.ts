@@ -1,6 +1,7 @@
 import {
   describePendingReviewFailure,
   PendingReviewCandidate,
+  planApprovalWithPendingReview,
   resolvePendingReview,
   validateReviewCommentDrafts,
   ReviewCommentDraft,
@@ -92,6 +93,56 @@ describe("describePendingReviewFailure", () => {
     expect(message).toContain("2 pending reviews");
     expect(message).toContain("ids: 10, 11");
     expect(message).toContain("review_id");
+  });
+});
+
+describe("planApprovalWithPendingReview", () => {
+  it("submits an empty draft (no body, no comments)", () => {
+    expect(planApprovalWithPendingReview(review(), 0, 7)).toEqual({
+      action: "submit",
+    });
+  });
+
+  it("treats a whitespace-only body as empty", () => {
+    expect(
+      planApprovalWithPendingReview(review({ body: "   " }), 0, 7)
+    ).toEqual({ action: "submit" });
+  });
+
+  it("blocks when the draft has a summary body", () => {
+    const plan = planApprovalWithPendingReview(
+      review({ id: 42, body: "WIP notes" }),
+      0,
+      7
+    );
+    expect(plan.action).toBe("block");
+    if (plan.action === "block") {
+      expect(plan.reason).toContain("a summary body");
+      expect(plan.reason).toContain("PR #7");
+      expect(plan.reason).toContain("review 42");
+      expect(plan.reason).toContain("submitPullRequestReview");
+      expect(plan.reason).toContain("deletePendingReview");
+    }
+  });
+
+  it("blocks when the draft has comments, with singular wording", () => {
+    const plan = planApprovalWithPendingReview(review(), 1, 7);
+    expect(plan.action).toBe("block");
+    if (plan.action === "block") {
+      expect(plan.reason).toContain("1 draft comment already exists");
+    }
+  });
+
+  it("blocks when the draft has both body and comments", () => {
+    const plan = planApprovalWithPendingReview(
+      review({ body: "WIP notes" }),
+      3,
+      7
+    );
+    expect(plan.action).toBe("block");
+    if (plan.action === "block") {
+      expect(plan.reason).toContain("a summary body and 3 draft comments");
+    }
   });
 });
 

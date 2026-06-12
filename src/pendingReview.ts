@@ -63,6 +63,42 @@ export function describePendingReviewFailure(
   );
 }
 
+/** What to do with an existing pending review when approving a PR. */
+export type PendingApprovalPlan =
+  | { action: "submit" }
+  | { action: "block"; reason: string };
+
+/**
+ * Decide whether an existing pending review can simply be submitted as an
+ * approval. An empty draft (no summary text, no draft comments) carries
+ * nothing unpublished, so submitting it is safe; a draft with content would
+ * be silently published by the approval, so it must be handled explicitly.
+ */
+export function planApprovalWithPendingReview(
+  review: PendingReviewCandidate,
+  commentCount: number,
+  pull_number: number
+): PendingApprovalPlan {
+  const hasBody =
+    typeof review.body === "string" && review.body.trim().length > 0;
+  if (!hasBody && commentCount === 0) return { action: "submit" };
+  const contents: string[] = [];
+  if (hasBody) contents.push("a summary body");
+  if (commentCount > 0) {
+    contents.push(
+      `${commentCount} draft comment${commentCount === 1 ? "" : "s"}`
+    );
+  }
+  return {
+    action: "block",
+    reason:
+      `A pending review with ${contents.join(" and ")} already exists on ` +
+      `PR #${pull_number} (review ${review.id}); approving would publish it. ` +
+      "Submit it with submitPullRequestReview (event: APPROVE) or discard " +
+      "it with deletePendingReview first.",
+  };
+}
+
 /** One inline comment in a batched review request. */
 export interface ReviewCommentDraft {
   path: string;

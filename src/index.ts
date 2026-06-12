@@ -46,10 +46,18 @@ import { CODEOWNERS_LOCATIONS, parseCodeowners } from "./codeowners.js";
 import {
   describePendingReviewFailure,
   PendingReviewCandidate,
+  planApprovalWithPendingReview,
   resolvePendingReview,
   ReviewCommentDraft,
   validateReviewCommentDrafts,
 } from "./pendingReview.js";
+import {
+  isContentLengthMismatchError,
+  parseFullName,
+  RepoMoveCache,
+  RepoSlug,
+  sameSlug,
+} from "./repoMove.js";
 import { applySignature, loadDotEnv } from "./signature.js";
 import { planCommentMode } from "./commentMode.js";
 
@@ -413,6 +421,7 @@ class GitHubServer {
   private readonly octokit: Octokit;
   private readonly config: GitHubConfig;
   private readonly paginator: GitHubPaginator;
+  private readonly repoMoves = new RepoMoveCache();
   private authenticatedLogin?: string;
   private readonly dangerousToolNames = new Set<string>([
     "deletePullRequestTask",
@@ -461,6 +470,26 @@ class GitHubServer {
       userAgent: "github-mcp",
     });
 
+    // Renamed/transferred repositories: GETs follow GitHub's redirect
+    // transparently, but requests with a body fail with a content-length
+    // mismatch because the body cannot be replayed. Rewrite such requests to
+    // the repository's current location and retry once. The rewrite mutates
+    // the options object in place: before-after-hook pre-binds that object
+    // through the whole wrap chain, so arguments passed to `request` are
+    // ignored and in-place mutation is the only way to change the request.
+    this.octokit.hook.wrap("request", async (request, options) => {
+      const params = options as unknown as Record<string, unknown>;
+      this.applyKnownRepoMove(params);
+      try {
+        return await request(options);
+      } catch (error) {
+        if (!isContentLengthMismatchError(error)) throw error;
+        const moved = await this.rewriteMovedRepo(params);
+        if (!moved) throw error;
+        return await request(options);
+      }
+    });
+
     this.paginator = new GitHubPaginator(logger);
 
     this.setupToolHandlers();
@@ -483,6 +512,68 @@ class GitHubServer {
       );
     }
     return { owner: resolvedOwner, repo: resolvedRepo };
+  }
+
+  /** Rewrite a request's owner/repo in place through any known move. */
+  private applyKnownRepoMove(options: Record<string, unknown>): void {
+    if (typeof options.owner !== "string" || typeof options.repo !== "string") {
+      return;
+    }
+    const moved = this.repoMoves.resolve({
+      owner: options.owner,
+      repo: options.repo,
+    });
+    if (!moved) return;
+    options.owner = moved.owner;
+    options.repo = moved.repo;
+  }
+
+  /**
+   * Look up where a request's repository lives now; when it has moved,
+   * record the move and rewrite the request's owner/repo in place. Returns
+   * false when the repository has not moved (or the lookup itself fails),
+   * meaning the original error stands.
+   */
+  private async rewriteMovedRepo(
+    options: Record<string, unknown>
+  ): Promise<boolean> {
+    if (typeof options.owner !== "string" || typeof options.repo !== "string") {
+      return false;
+    }
+    const from: RepoSlug = { owner: options.owner, repo: options.repo };
+    let fullName: unknown;
+    try {
+      fullName = (
+        await this.octokit.rest.repos.get({
+          owner: from.owner,
+          repo: from.repo,
+        })
+      ).data.full_name;
+    } catch {
+      return false;
+    }
+    const to = parseFullName(fullName);
+    if (!to || sameSlug(from, to)) return false;
+    this.repoMoves.record(from, to);
+    this.adoptMovedDefaults(from, to);
+    logger.warn("Repository moved; retrying request at its new location", {
+      from: `${from.owner}/${from.repo}`,
+      to: `${to.owner}/${to.repo}`,
+    });
+    options.owner = to.owner;
+    options.repo = to.repo;
+    return true;
+  }
+
+  /** Update GITHUB_OWNER/GITHUB_REPO defaults that point at a moved repo. */
+  private adoptMovedDefaults(from: RepoSlug, to: RepoSlug): void {
+    if (this.config.defaultOwner?.toLowerCase() !== from.owner.toLowerCase()) {
+      return;
+    }
+    if (this.config.defaultRepo?.toLowerCase() === from.repo.toLowerCase()) {
+      this.config.defaultRepo = to.repo;
+    }
+    this.config.defaultOwner = to.owner;
   }
 
   private async getAuthenticatedLogin(): Promise<string> {
@@ -744,7 +835,7 @@ class GitHubServer {
         {
           name: "approvePullRequest",
           description:
-            "Approve a pull request by submitting an APPROVE review",
+            "Approve a pull request by submitting an APPROVE review. An existing empty pending review is submitted as the approval; a pending review with draft content must be submitted (submitPullRequestReview) or discarded (deletePendingReview) first.",
           inputSchema: {
             type: "object",
             properties: {
@@ -2363,21 +2454,147 @@ class GitHubServer {
       "approvePullRequest",
       { ...ctx, pull_number },
       async () => {
-        const response = await this.octokit.rest.pulls.createReview({
-          owner: ctx.owner,
-          repo: ctx.repo,
-          pull_number,
-          event: "APPROVE",
-          ...(body !== undefined ? { body } : {}),
-        });
-        return this.json({
-          review_id: response.data.id,
-          state: response.data.state,
-          author: response.data.user?.login,
-          submitted_at: response.data.submitted_at,
-        });
+        // An existing pending review blocks review creation, so handle it
+        // first: submit an empty draft as the approval, refuse to silently
+        // publish one that has content.
+        const existing = await this.findOwnPendingReview(
+          ctx.owner,
+          ctx.repo,
+          pull_number
+        );
+        if (existing) {
+          const commentCount = await this.countReviewComments(
+            ctx,
+            pull_number,
+            existing.id
+          );
+          const plan = planApprovalWithPendingReview(
+            existing,
+            commentCount,
+            pull_number
+          );
+          if (plan.action === "block") {
+            throw new McpError(ErrorCode.InvalidParams, plan.reason);
+          }
+          return await this.submitApproval(
+            ctx,
+            pull_number,
+            existing.id,
+            body,
+            "Submitted an existing empty pending review as the approval."
+          );
+        }
+
+        try {
+          const response = await this.octokit.rest.pulls.createReview({
+            owner: ctx.owner,
+            repo: ctx.repo,
+            pull_number,
+            event: "APPROVE",
+            ...(body !== undefined ? { body } : {}),
+          });
+          return this.json({
+            review_id: response.data.id,
+            state: response.data.state,
+            author: response.data.user?.login,
+            submitted_at: response.data.submitted_at,
+          });
+        } catch (error) {
+          // A failed create may still have created the pending review on
+          // GitHub's side. Finish the approval by submitting that orphan,
+          // or discard it so a retry isn't blocked by it.
+          const orphan = await this.findOwnPendingReview(
+            ctx.owner,
+            ctx.repo,
+            pull_number
+          ).catch(() => undefined);
+          if (orphan) {
+            try {
+              return await this.submitApproval(
+                ctx,
+                pull_number,
+                orphan.id,
+                body,
+                "Recovered by submitting the pending review left by a failed review creation."
+              );
+            } catch {
+              await this.octokit.rest.pulls
+                .deletePendingReview({
+                  owner: ctx.owner,
+                  repo: ctx.repo,
+                  pull_number,
+                  review_id: orphan.id,
+                })
+                .catch(() => undefined);
+            }
+          }
+          throw error;
+        }
       }
     );
+  }
+
+  /**
+   * Find the authenticated user's pending review on a PR, or undefined when
+   * there is none. Throws InvalidParams when the lookup is ambiguous.
+   */
+  private async findOwnPendingReview(
+    owner: string,
+    repo: string,
+    pull_number: number
+  ): Promise<PendingReviewCandidate | undefined> {
+    const login = await this.getAuthenticatedLogin();
+    const reviews = await this.listAllReviews(owner, repo, pull_number);
+    const resolution = resolvePendingReview(reviews, login);
+    if (resolution.kind === "ambiguous") {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        describePendingReviewFailure(resolution, login, pull_number)
+      );
+    }
+    return resolution.kind === "found" ? resolution.review : undefined;
+  }
+
+  /** Count a review's comments (first page only; up to 100). */
+  private async countReviewComments(
+    ctx: { owner: string; repo: string },
+    pull_number: number,
+    review_id: number
+  ): Promise<number> {
+    const response = await this.octokit.rest.pulls.listCommentsForReview({
+      owner: ctx.owner,
+      repo: ctx.repo,
+      pull_number,
+      review_id,
+      per_page: 100,
+      page: 1,
+    });
+    return response.data.length;
+  }
+
+  /** Submit a pending review as an APPROVE event. */
+  private async submitApproval(
+    ctx: { owner: string; repo: string },
+    pull_number: number,
+    review_id: number,
+    body: string | undefined,
+    note: string
+  ) {
+    const response = await this.octokit.rest.pulls.submitReview({
+      owner: ctx.owner,
+      repo: ctx.repo,
+      pull_number,
+      review_id,
+      event: "APPROVE",
+      ...(body !== undefined ? { body } : {}),
+    });
+    return this.json({
+      review_id: response.data.id,
+      state: response.data.state,
+      author: response.data.user?.login,
+      submitted_at: response.data.submitted_at,
+      note,
+    });
   }
 
   async unapprovePullRequest(

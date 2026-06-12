@@ -40,7 +40,8 @@ Adding a tool means touching all three.
 - `src/diffChunks.ts` — unified-diff hunk extraction
 - `src/threads.ts` — comment thread building (in_reply_to_id chains) and new-reply detection
 - `src/codeowners.ts` — CODEOWNERS parsing
-- `src/pendingReview.ts` — pending-review resolution and review-comment draft validation (review batching)
+- `src/pendingReview.ts` — pending-review resolution, review-comment draft validation (review batching), and approval planning around existing pending reviews
+- `src/repoMove.ts` — renamed/transferred repo handling: recognizing the content-length-mismatch failure caused by GitHub's redirect on requests with a body, plus the old-slug → new-slug move cache used to rewrite and retry such requests
 
 Repetitive data processing belongs in these modules (code over compute), keeping it testable without network access.
 
