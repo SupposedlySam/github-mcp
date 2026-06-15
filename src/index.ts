@@ -3403,6 +3403,9 @@ class GitHubServer {
     comment_type?: "review" | "issue"
   ) {
     const ctx = this.resolveContext(owner, repo);
+    // Sign once, before mode dispatch, so both review and issue edits post the
+    // signed body — matching the create/reply paths.
+    body = applySignature(body);
     return this.guard(
       "updatePullRequestComment",
       { ...ctx, comment_id, comment_type },
