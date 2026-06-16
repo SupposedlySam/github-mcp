@@ -150,7 +150,7 @@ Every tool accepts optional `owner`/`repo` (defaulting to
 
 | Tool | Bitbucket equivalent | Notes |
 |------|---------------------|-------|
-| `getPullRequestComments` | `getPullRequestComments` | Issue comments + review comments grouped into threads, with resolution state via GraphQL |
+| `getPullRequestComments` | `getPullRequestComments` | Issue comments + review comments grouped into threads. Every comment carries `is_minimized` / `minimized_reason`; every review thread carries `is_resolved` / `is_outdated` (all via GraphQL) |
 | `getPullRequestComment` | `getPullRequestComment` | Auto-detects review vs issue comment |
 | `addPullRequestComment` | `addPullRequestComment` | Top-level, inline (`path`+`line`), or reply (`in_reply_to`) |
 | `updatePullRequestComment` | `updatePullRequestComment` | |
@@ -159,7 +159,7 @@ Every tool accepts optional `owner`/`repo` (defaulting to
 | `reopenComment` | `reopenComment` | GraphQL `unresolveReviewThread` |
 | `minimizePullRequestComment` | — | Hide/collapse a comment with a reason (GraphQL `minimizeComment`); numeric id auto-resolved to node id; `reason` defaults to `OUTDATED` |
 | `unminimizePullRequestComment` | — | Un-collapse a minimized comment (GraphQL `unminimizeComment`) |
-| `checkPrReplies` | `checkPrReplies` | Finds threads with replies newer than your last comment; identity defaults to the authenticated user's login |
+| `checkPrReplies` | `checkPrReplies` | Finds threads with replies newer than your last comment; identity defaults to the authenticated user's login. Each thread carries `is_resolved` and the latest comment's `latest_comment_is_minimized` / `latest_comment_minimized_reason` |
 
 ### Review batching
 

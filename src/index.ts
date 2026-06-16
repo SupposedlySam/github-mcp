@@ -39,6 +39,7 @@ import { filterChunksByPath, parseDiffChunks } from "./diffChunks.js";
 import {
   buildDiscussionThread,
   buildReviewThreads,
+  CommentThread,
   findThreadsWithNewReplies,
   ThreadComment,
 } from "./threads.js";
@@ -285,7 +286,13 @@ function summarizeSearchItem(item: any) {
   };
 }
 
-function summarizeComment(comment: any) {
+/** Hidden ("minimized") state of a comment, exposed only via GraphQL. */
+interface MinimizedState {
+  isMinimized: boolean;
+  minimizedReason: string | null;
+}
+
+function summarizeComment(comment: any, minimized?: MinimizedState) {
   return {
     id: comment.id,
     author: comment.user?.login,
@@ -297,6 +304,8 @@ function summarizeComment(comment: any) {
     line: comment.line ?? comment.original_line,
     start_line: comment.start_line ?? comment.original_start_line,
     html_url: comment.html_url,
+    is_minimized: minimized?.isMinimized ?? false,
+    minimized_reason: minimized?.minimizedReason ?? null,
   };
 }
 
@@ -349,10 +358,26 @@ const REVIEW_THREADS_QUERY = `
           nodes {
             id
             isResolved
+            isOutdated
             comments(first: 100) {
-              nodes { databaseId }
+              nodes { databaseId isMinimized minimizedReason }
             }
           }
+        }
+      }
+    }
+  }
+`;
+
+// Issue (top-level conversation) comments only expose their hidden state via
+// GraphQL; this query maps each comment's databaseId to that state.
+const ISSUE_COMMENTS_MINIMIZED_QUERY = `
+  query IssueCommentsMinimized($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+    repository(owner: $owner, name: $repo) {
+      pullRequest(number: $number) {
+        comments(first: 100, after: $cursor) {
+          pageInfo { hasNextPage endCursor }
+          nodes { databaseId isMinimized minimizedReason }
         }
       }
     }
@@ -1114,7 +1139,7 @@ class GitHubServer {
         {
           name: "getPullRequestComments",
           description:
-            "Get all comments on a pull request: top-level conversation (issue) comments plus inline review comments grouped into threads, with thread resolution status when available.",
+            "Get all comments on a pull request: top-level conversation (issue) comments plus inline review comments grouped into threads. Each comment includes is_minimized and minimized_reason (e.g. \"OUTDATED\"/\"RESOLVED\", null when visible). Each review thread includes is_resolved and is_outdated.",
           inputSchema: {
             type: "object",
             properties: {
@@ -1334,7 +1359,7 @@ class GitHubServer {
         {
           name: "checkPrReplies",
           description:
-            "Check PR comment threads for replies. Default (self) mode finds threads where the given user has commented and someone else replied after their last comment. `all` mode returns every thread that has at least one reply. Identity defaults to the authenticated user's login.",
+            "Check PR comment threads for replies. Default (self) mode finds threads where the given user has commented and someone else replied after their last comment. `all` mode returns every thread that has at least one reply. Each returned thread carries is_resolved (null for the issue-comment pseudo-thread) and the latest comment's latest_comment_is_minimized / latest_comment_minimized_reason. Identity defaults to the authenticated user's login.",
           inputSchema: {
             type: "object",
             properties: {
@@ -3280,15 +3305,35 @@ class GitHubServer {
   }
 
   /**
-   * Map review-comment database ids to their GraphQL review thread id and
-   * resolution state. Thread resolution only exists in the GraphQL API.
+   * Fetch GraphQL-only state for a PR's review threads. Returns, keyed by
+   * review-comment databaseId, the thread's GraphQL id, resolution state, and
+   * outdated state, plus each comment's hidden ("minimized") state. Thread
+   * resolution/outdated and comment minimization only exist in GraphQL.
    */
   private async fetchReviewThreadMap(
     owner: string,
     repo: string,
     pull_number: number
-  ): Promise<Map<number, { threadId: string; isResolved: boolean }>> {
-    const map = new Map<number, { threadId: string; isResolved: boolean }>();
+  ): Promise<
+    Map<
+      number,
+      {
+        threadId: string;
+        isResolved: boolean;
+        isOutdated: boolean;
+        minimized: MinimizedState;
+      }
+    >
+  > {
+    const map = new Map<
+      number,
+      {
+        threadId: string;
+        isResolved: boolean;
+        isOutdated: boolean;
+        minimized: MinimizedState;
+      }
+    >();
     let cursor: string | null = null;
     for (;;) {
       const response: any = await this.octokit.graphql(REVIEW_THREADS_QUERY, {
@@ -3305,12 +3350,49 @@ class GitHubServer {
             map.set(comment.databaseId, {
               threadId: node.id,
               isResolved: node.isResolved === true,
+              isOutdated: node.isOutdated === true,
+              minimized: {
+                isMinimized: comment.isMinimized === true,
+                minimizedReason: comment.minimizedReason ?? null,
+              },
             });
           }
         }
       }
       if (!threads.pageInfo?.hasNextPage) break;
       cursor = threads.pageInfo.endCursor;
+    }
+    return map;
+  }
+
+  /**
+   * Map issue (top-level conversation) comment databaseIds to their hidden
+   * ("minimized") state, which the REST API does not expose.
+   */
+  private async fetchIssueCommentMinimizedMap(
+    owner: string,
+    repo: string,
+    pull_number: number
+  ): Promise<Map<number, MinimizedState>> {
+    const map = new Map<number, MinimizedState>();
+    let cursor: string | null = null;
+    for (;;) {
+      const response: any = await this.octokit.graphql(
+        ISSUE_COMMENTS_MINIMIZED_QUERY,
+        { owner, repo, number: pull_number, cursor }
+      );
+      const comments = response?.repository?.pullRequest?.comments;
+      if (!comments) break;
+      for (const node of comments.nodes ?? []) {
+        if (typeof node?.databaseId === "number") {
+          map.set(node.databaseId, {
+            isMinimized: node.isMinimized === true,
+            minimizedReason: node.minimizedReason ?? null,
+          });
+        }
+      }
+      if (!comments.pageInfo?.hasNextPage) break;
+      cursor = comments.pageInfo.endCursor;
     }
     return map;
   }
@@ -3330,7 +3412,12 @@ class GitHubServer {
 
         let resolution = new Map<
           number,
-          { threadId: string; isResolved: boolean }
+          {
+            threadId: string;
+            isResolved: boolean;
+            isOutdated: boolean;
+            minimized: MinimizedState;
+          }
         >();
         try {
           resolution = await this.fetchReviewThreadMap(
@@ -3344,18 +3431,37 @@ class GitHubServer {
           });
         }
 
+        let issueMinimized = new Map<number, MinimizedState>();
+        try {
+          issueMinimized = await this.fetchIssueCommentMinimizedMap(
+            ctx.owner,
+            ctx.repo,
+            pull_number
+          );
+        } catch (error) {
+          logger.warn("Could not fetch issue comment minimized state", {
+            error,
+          });
+        }
+
         const rawById = new Map(rawReview.map((c: any) => [c.id, c]));
         const threads = buildReviewThreads(reviewComments).map((thread) => ({
           thread_id: thread.thread_id,
           location: thread.location,
-          is_resolved: resolution.get(thread.thread_id)?.isResolved,
+          is_resolved: resolution.get(thread.thread_id)?.isResolved ?? false,
+          is_outdated: resolution.get(thread.thread_id)?.isOutdated ?? false,
           comments: thread.comments.map((c) =>
-            summarizeComment(rawById.get(c.id) ?? c)
+            summarizeComment(
+              rawById.get(c.id) ?? c,
+              resolution.get(c.id)?.minimized
+            )
           ),
         }));
 
         return this.json({
-          issue_comments: rawIssue.map(summarizeComment),
+          issue_comments: rawIssue.map((c: any) =>
+            summarizeComment(c, issueMinimized.get(c.id))
+          ),
           review_threads: threads,
           counts: {
             issue_comments: rawIssue.length,
@@ -3792,15 +3898,56 @@ class GitHubServer {
             ? [...reviewThreads, discussion]
             : reviewThreads;
 
+          // GraphQL-only state: thread resolution and per-comment hidden state.
+          // Best-effort — a failure leaves the reply detection intact.
+          let resolution = new Map<
+            number,
+            {
+              threadId: string;
+              isResolved: boolean;
+              isOutdated: boolean;
+              minimized: MinimizedState;
+            }
+          >();
+          let issueMinimized = new Map<number, MinimizedState>();
+          try {
+            [resolution, issueMinimized] = await Promise.all([
+              this.fetchReviewThreadMap(ctx.owner, ctx.repo, prNumber),
+              this.fetchIssueCommentMinimizedMap(ctx.owner, ctx.repo, prNumber),
+            ]);
+          } catch (error) {
+            logger.warn("Could not fetch GraphQL comment state", { error });
+          }
+
+          // Resolution only applies to review threads; the issue-comment
+          // pseudo-thread has none. Latest-comment hidden state comes from the
+          // review map (by comment id) or the issue map per kind.
+          const threadResolution = (thread: CommentThread): boolean | null =>
+            thread.kind === "review"
+              ? (resolution.get(thread.thread_id)?.isResolved ?? false)
+              : null;
+          const latestMinimized = (thread: CommentThread): MinimizedState => {
+            const latest = thread.comments[thread.comments.length - 1];
+            const state =
+              thread.kind === "review"
+                ? resolution.get(latest.id)?.minimized
+                : issueMinimized.get(latest.id);
+            return state ?? { isMinimized: false, minimizedReason: null };
+          };
+
           if (all) {
             const activeThreads = allThreads
               .filter((thread) => thread.comments.length >= 2)
               .map((thread) => {
                 const root = thread.comments[0];
+                const latest = latestMinimized(thread);
                 return {
                   thread_id: thread.thread_id,
                   kind: thread.kind,
                   location: thread.location,
+                  is_resolved: threadResolution(thread),
+                  latest_comment_is_minimized: latest.isMinimized,
+                  latest_comment_minimized_reason: latest.minimizedReason,
                   root_comment: {
                     author: root.user.login,
                     content: root.body,
@@ -3824,11 +3971,25 @@ class GitHubServer {
             };
           } else {
             const summary = findThreadsWithNewReplies(allThreads, selfLogin);
+            const byId = new Map(allThreads.map((t) => [t.thread_id, t]));
+            const threads = summary.threads.map((t) => {
+              const thread = byId.get(t.thread_id);
+              const latest = thread
+                ? latestMinimized(thread)
+                : { isMinimized: false, minimizedReason: null };
+              return {
+                ...t,
+                is_resolved: thread ? threadResolution(thread) : null,
+                latest_comment_is_minimized: latest.isMinimized,
+                latest_comment_minimized_reason: latest.minimizedReason,
+              };
+            });
             results[prNumber] = {
               mode: "self",
               self: selfLogin,
               total_threads: allThreads.length,
               ...summary,
+              threads,
             };
           }
         }
