@@ -411,6 +411,15 @@ const MINIMIZE_REASONS = [
   "LOW_QUALITY",
 ] as const;
 
+// Known GitHub bug (open since 2022): minimizeComment lowercases the classifier
+// internally after processing, so OUTDATED comes back as "outdated" in
+// minimizedReason. GitHub's collapsed-comment label renderer only matches the
+// upper-cased classifier, so an API-minimized comment renders the generic
+// "This comment has been minimized" instead of the specific reason. The hide
+// itself works and the reason is recorded; only the rendered label is generic.
+// The web UI uses a separate internal API that preserves casing, hence the
+// specific label there. Not fixable from the client.
+// https://github.com/orgs/community/discussions/19865
 const MINIMIZE_COMMENT_MUTATION = `
   mutation MinimizeComment($subjectId: ID!, $classifier: ReportedContentClassifiers!) {
     minimizeComment(input: { subjectId: $subjectId, classifier: $classifier }) {
@@ -1297,7 +1306,7 @@ class GitHubServer {
         {
           name: "minimizePullRequestComment",
           description:
-            "Minimize (collapse/hide) a comment with a classification reason, matching the web UI 'Hide' action (GraphQL minimizeComment). Works on conversation/issue comments and PR review comments; the numeric id is auto-resolved to its node id.",
+            "Minimize (collapse/hide) a comment with a classification reason, matching the web UI 'Hide' action (GraphQL minimizeComment). Works on conversation/issue comments and PR review comments; the numeric id is auto-resolved to its node id. Known GitHub limitation: the comment is correctly hidden and the reason is recorded (queryable as minimizedReason), but the collapsed label always renders generically (\"This comment has been minimized\") instead of the specific reason (\"...marked as outdated\") — GitHub's API lowercases the classifier internally and its label renderer only matches the upper-cased form. Open bug since 2022: https://github.com/orgs/community/discussions/19865",
           inputSchema: {
             type: "object",
             properties: {

@@ -157,7 +157,7 @@ Every tool accepts optional `owner`/`repo` (defaulting to
 | `deletePullRequestComment` | `deletePullRequestComment` | |
 | `resolveComment` | `resolveComment` | GraphQL `resolveReviewThread` |
 | `reopenComment` | `reopenComment` | GraphQL `unresolveReviewThread` |
-| `minimizePullRequestComment` | — | Hide/collapse a comment with a reason (GraphQL `minimizeComment`); numeric id auto-resolved to node id; `reason` defaults to `OUTDATED` |
+| `minimizePullRequestComment` | — | Hide/collapse a comment with a reason (GraphQL `minimizeComment`); numeric id auto-resolved to node id; `reason` defaults to `OUTDATED`. Known limitation: the comment is hidden and the reason recorded, but GitHub renders the generic "This comment has been minimized" label instead of the specific reason ([community discussion #19865](https://github.com/orgs/community/discussions/19865)) |
 | `unminimizePullRequestComment` | — | Un-collapse a minimized comment (GraphQL `unminimizeComment`) |
 | `checkPrReplies` | `checkPrReplies` | Finds threads with replies newer than your last comment; identity defaults to the authenticated user's login. Each thread carries `is_resolved` and the latest comment's `latest_comment_is_minimized` / `latest_comment_minimized_reason` |
 
