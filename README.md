@@ -157,6 +157,8 @@ Every tool accepts optional `owner`/`repo` (defaulting to
 | `deletePullRequestComment` | `deletePullRequestComment` | |
 | `resolveComment` | `resolveComment` | GraphQL `resolveReviewThread` |
 | `reopenComment` | `reopenComment` | GraphQL `unresolveReviewThread` |
+| `minimizePullRequestComment` | — | Hide/collapse a comment with a reason (GraphQL `minimizeComment`); numeric id auto-resolved to node id; `reason` defaults to `OUTDATED` |
+| `unminimizePullRequestComment` | — | Un-collapse a minimized comment (GraphQL `unminimizeComment`) |
 | `checkPrReplies` | `checkPrReplies` | Finds threads with replies newer than your last comment; identity defaults to the authenticated user's login |
 
 ### Review batching

@@ -375,6 +375,33 @@ const UNRESOLVE_THREAD_MUTATION = `
   }
 `;
 
+/** Valid values of the GraphQL ReportedContentClassifiers enum. */
+const MINIMIZE_REASONS = [
+  "OUTDATED",
+  "RESOLVED",
+  "OFF_TOPIC",
+  "DUPLICATE",
+  "SPAM",
+  "ABUSE",
+  "LOW_QUALITY",
+] as const;
+
+const MINIMIZE_COMMENT_MUTATION = `
+  mutation MinimizeComment($subjectId: ID!, $classifier: ReportedContentClassifiers!) {
+    minimizeComment(input: { subjectId: $subjectId, classifier: $classifier }) {
+      minimizedComment { isMinimized minimizedReason }
+    }
+  }
+`;
+
+const UNMINIMIZE_COMMENT_MUTATION = `
+  mutation UnminimizeComment($subjectId: ID!) {
+    unminimizeComment(input: { subjectId: $subjectId }) {
+      unminimizedComment { isMinimized }
+    }
+  }
+`;
+
 const MARK_READY_MUTATION = `
   mutation MarkReady($pullRequestId: ID!) {
     markPullRequestReadyForReview(input: { pullRequestId: $pullRequestId }) {
@@ -1243,6 +1270,68 @@ class GitHubServer {
           },
         },
         {
+          name: "minimizePullRequestComment",
+          description:
+            "Minimize (collapse/hide) a comment with a classification reason, matching the web UI 'Hide' action (GraphQL minimizeComment). Works on conversation/issue comments and PR review comments; the numeric id is auto-resolved to its node id.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              ...OWNER_REPO_SCHEMA,
+              comment_id: {
+                type: "number",
+                description:
+                  "Numeric comment id (issue/conversation or PR review comment). Auto-resolved to a GraphQL node id.",
+              },
+              comment_type: {
+                type: "string",
+                enum: ["review", "issue"],
+                description:
+                  "Comment kind: review (inline) or issue (top-level/conversation). Auto-detected when omitted.",
+              },
+              reason: {
+                type: "string",
+                enum: [...MINIMIZE_REASONS],
+                description:
+                  "Classification reason (ReportedContentClassifiers). Case-insensitive. Defaults to OUTDATED.",
+              },
+              node_id: {
+                type: "string",
+                description:
+                  "GraphQL node id to minimize directly, bypassing numeric-id resolution.",
+              },
+            },
+            required: [],
+          },
+        },
+        {
+          name: "unminimizePullRequestComment",
+          description:
+            "Unminimize (un-collapse) a previously minimized comment (GraphQL unminimizeComment). Works on conversation/issue comments and PR review comments; the numeric id is auto-resolved to its node id.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              ...OWNER_REPO_SCHEMA,
+              comment_id: {
+                type: "number",
+                description:
+                  "Numeric comment id (issue/conversation or PR review comment). Auto-resolved to a GraphQL node id.",
+              },
+              comment_type: {
+                type: "string",
+                enum: ["review", "issue"],
+                description:
+                  "Comment kind: review (inline) or issue (top-level/conversation). Auto-detected when omitted.",
+              },
+              node_id: {
+                type: "string",
+                description:
+                  "GraphQL node id to unminimize directly, bypassing numeric-id resolution.",
+              },
+            },
+            required: [],
+          },
+        },
+        {
           name: "checkPrReplies",
           description:
             "Check PR comment threads for replies. Default (self) mode finds threads where the given user has commented and someone else replied after their last comment. `all` mode returns every thread that has at least one reply. Identity defaults to the authenticated user's login.",
@@ -1905,6 +1994,23 @@ class GitHubServer {
               args.pull_number as number,
               args.comment_id as number,
               false
+            );
+          case "minimizePullRequestComment":
+            return await this.minimizePullRequestComment(
+              args.owner as string | undefined,
+              args.repo as string | undefined,
+              args.comment_id as number | undefined,
+              args.reason as string | undefined,
+              args.comment_type as "review" | "issue" | undefined,
+              args.node_id as string | undefined
+            );
+          case "unminimizePullRequestComment":
+            return await this.unminimizePullRequestComment(
+              args.owner as string | undefined,
+              args.repo as string | undefined,
+              args.comment_id as number | undefined,
+              args.comment_type as "review" | "issue" | undefined,
+              args.node_id as string | undefined
             );
           case "checkPrReplies":
             return await this.checkPrReplies(
@@ -3527,6 +3633,134 @@ class GitHubServer {
         });
       }
     );
+  }
+
+  /**
+   * Resolve a numeric comment id to its GraphQL node id. Tries the PR review
+   * comment endpoint first, falling back to the issue/conversation comment
+   * endpoint, unless comment_type narrows the lookup.
+   */
+  private async resolveCommentNodeId(
+    owner: string,
+    repo: string,
+    comment_id: number,
+    comment_type?: "review" | "issue"
+  ): Promise<string> {
+    if (comment_type !== "issue") {
+      try {
+        const response = await this.octokit.rest.pulls.getReviewComment({
+          owner,
+          repo,
+          comment_id,
+        });
+        return response.data.node_id;
+      } catch (error) {
+        const canFallBack =
+          comment_type === undefined &&
+          isRequestError(error) &&
+          error.status === 404;
+        if (!canFallBack) throw error;
+      }
+    }
+    const response = await this.octokit.rest.issues.getComment({
+      owner,
+      repo,
+      comment_id,
+    });
+    return response.data.node_id;
+  }
+
+  async minimizePullRequestComment(
+    owner: string | undefined,
+    repo: string | undefined,
+    comment_id: number | undefined,
+    reason?: string,
+    comment_type?: "review" | "issue",
+    node_id?: string
+  ) {
+    const ctx = this.resolveContext(owner, repo);
+    return this.guard(
+      "minimizePullRequestComment",
+      { ...ctx, comment_id, reason, comment_type, node_id },
+      async () => {
+        const classifier = (reason ?? "OUTDATED").trim().toUpperCase();
+        if (!(MINIMIZE_REASONS as readonly string[]).includes(classifier)) {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            `Invalid reason '${reason}'. Expected one of: ${MINIMIZE_REASONS.join(
+              ", "
+            )}`
+          );
+        }
+        const subjectId = await this.resolveSubjectId(
+          ctx.owner,
+          ctx.repo,
+          comment_id,
+          comment_type,
+          node_id
+        );
+        const response: any = await this.octokit.graphql(
+          MINIMIZE_COMMENT_MUTATION,
+          { subjectId, classifier }
+        );
+        const minimized = response?.minimizeComment?.minimizedComment;
+        return this.json({
+          comment_id,
+          isMinimized: minimized?.isMinimized ?? true,
+          minimizedReason: minimized?.minimizedReason ?? classifier.toLowerCase(),
+        });
+      }
+    );
+  }
+
+  async unminimizePullRequestComment(
+    owner: string | undefined,
+    repo: string | undefined,
+    comment_id: number | undefined,
+    comment_type?: "review" | "issue",
+    node_id?: string
+  ) {
+    const ctx = this.resolveContext(owner, repo);
+    return this.guard(
+      "unminimizePullRequestComment",
+      { ...ctx, comment_id, comment_type, node_id },
+      async () => {
+        const subjectId = await this.resolveSubjectId(
+          ctx.owner,
+          ctx.repo,
+          comment_id,
+          comment_type,
+          node_id
+        );
+        const response: any = await this.octokit.graphql(
+          UNMINIMIZE_COMMENT_MUTATION,
+          { subjectId }
+        );
+        const unminimized = response?.unminimizeComment?.unminimizedComment;
+        return this.json({
+          comment_id,
+          isMinimized: unminimized?.isMinimized ?? false,
+        });
+      }
+    );
+  }
+
+  /** Pick a GraphQL subject id from an explicit node id or a numeric comment id. */
+  private async resolveSubjectId(
+    owner: string,
+    repo: string,
+    comment_id: number | undefined,
+    comment_type?: "review" | "issue",
+    node_id?: string
+  ): Promise<string> {
+    if (node_id && node_id.trim().length > 0) return node_id.trim();
+    if (typeof comment_id !== "number") {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        "Either comment_id (numeric) or node_id must be provided"
+      );
+    }
+    return this.resolveCommentNodeId(owner, repo, comment_id, comment_type);
   }
 
   async checkPrReplies(
