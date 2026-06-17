@@ -61,6 +61,17 @@ import {
 } from "./repoMove.js";
 import { applySignature, loadDotEnv } from "./signature.js";
 import { planCommentMode } from "./commentMode.js";
+import {
+  classifyReleaseRef,
+  matchesPattern,
+  resolveTargetPath,
+  summarizeRelease,
+  summarizeReleaseAsset,
+  ReleaseAssetSummary,
+} from "./releases.js";
+import crypto from "crypto";
+import { pipeline as streamPipeline } from "stream/promises";
+import { Readable, Writable } from "stream";
 
 // Load a gitignored `.env` from the project root before any process.env reads.
 // process.env always wins; `.env` only fills in unset variables.
@@ -2092,6 +2103,118 @@ class GitHubServer {
             },
           },
         },
+        {
+          name: "getLatestRelease",
+          description:
+            "Get the latest published, non-draft, non-prerelease release. Returns the same shape as getRelease. Convenience wrapper for the common babysit case (`have I seen this tag yet?`). 404s when the repository has no published releases.",
+          inputSchema: {
+            type: "object",
+            properties: { ...OWNER_REPO_SCHEMA },
+          },
+        },
+        {
+          name: "getRelease",
+          description:
+            "Get a release by its tag name (e.g. `v0.3.0`). Returns id, tag_name, name, body, draft, prerelease, published_at, html_url, author, tarball_url, zipball_url, and an assets[] array each with download metadata.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              ...OWNER_REPO_SCHEMA,
+              tag: {
+                type: "string",
+                description: "Release tag name (e.g. `v0.3.0`)",
+              },
+            },
+            required: ["tag"],
+          },
+        },
+        {
+          name: "getReleaseById",
+          description:
+            "Get a release by its numeric id. Use this when you already have the release id (e.g. from listReleases) and want to skip the tag lookup. Draft releases are visible only with a token that has write access.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              ...OWNER_REPO_SCHEMA,
+              release_id: {
+                type: "number",
+                description: "Numeric release id",
+              },
+            },
+            required: ["release_id"],
+          },
+        },
+        {
+          name: "listReleases",
+          description:
+            "List releases for a repository (newest first, GitHub's default order). Includes drafts and prereleases. Same pagination contract as the other list-shaped tools (per_page / page / all).",
+          inputSchema: {
+            type: "object",
+            properties: {
+              ...OWNER_REPO_SCHEMA,
+              ...PAGINATION_BASE_SCHEMA,
+              all: PAGINATION_ALL_SCHEMA,
+            },
+          },
+        },
+        {
+          name: "downloadReleaseAsset",
+          description:
+            "Download a single release asset to a local path. Streams the response (does not buffer the whole file) and follows GitHub's redirect chain to the signed CDN URL. Sets `Accept: application/octet-stream` per the GitHub docs. `target_path` is resolved as: absolute paths used as-is, `~/...` expanded to the user's home, and relative paths resolved against the MCP server's working directory (`process.cwd()`). Fails if the target already exists unless `overwrite: true` is set. Callers are responsible for chmod (the file is written with the default umask). Returns { bytes_written, sha256, content_type, target_path, asset: {id, name, size} }.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              ...OWNER_REPO_SCHEMA,
+              asset_id: {
+                type: "number",
+                description: "Numeric asset id (from listReleases / getRelease assets[])",
+              },
+              target_path: {
+                type: "string",
+                description:
+                  "Where to write the file. Absolute, `~/...`, or relative to the MCP server's cwd.",
+              },
+              overwrite: {
+                type: "boolean",
+                description:
+                  "When true, overwrite an existing file at target_path. Defaults to false (the call fails if the file exists).",
+              },
+            },
+            required: ["asset_id", "target_path"],
+          },
+        },
+        {
+          name: "downloadReleaseAssets",
+          description:
+            "Download multiple assets from a release into a directory. Convenient for releases that ship per-platform artifacts when you only want one. `release_id_or_tag` accepts a numeric id, an all-digits string, or a tag name (e.g. `v0.3.0`). `pattern` is a shell-style glob (`*macos-arm64*`) or `/regex/flags` literal applied to each asset name; when omitted, every asset is downloaded. Streams each asset (no full-file buffering), follows the CDN redirect, and writes into `target_dir` using the asset name. Fails per file if the target exists unless `overwrite: true`. `target_dir` resolves like `downloadReleaseAsset`'s target_path; the directory is created if missing. Returns { downloads: [...], skipped_no_match: [...] }.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              ...OWNER_REPO_SCHEMA,
+              release_id_or_tag: {
+                type: ["string", "number"],
+                description:
+                  "Numeric release id or tag name (e.g. `v0.3.0`). All-digit strings are treated as ids.",
+              },
+              target_dir: {
+                type: "string",
+                description:
+                  "Directory to download assets into. Absolute, `~/...`, or relative to the MCP server's cwd. Created if missing.",
+              },
+              pattern: {
+                type: "string",
+                description:
+                  "Optional glob (`*macos-arm64*`) or `/regex/flags` literal matched against the asset name. Omit to download every asset.",
+              },
+              overwrite: {
+                type: "boolean",
+                description:
+                  "When true, overwrite existing files. Defaults to false (a download fails for that file if it already exists).",
+              },
+            },
+            required: ["release_id_or_tag", "target_dir"],
+          },
+        },
       ].filter(
         (tool) =>
           this.config.allowDangerousCommands === true ||
@@ -2641,6 +2764,48 @@ class GitHubServer {
               args.owner as string | undefined,
               args.repo as string | undefined,
               args.ref as string | undefined
+            );
+          case "getLatestRelease":
+            return await this.getLatestRelease(
+              args.owner as string | undefined,
+              args.repo as string | undefined
+            );
+          case "getRelease":
+            return await this.getRelease(
+              args.owner as string | undefined,
+              args.repo as string | undefined,
+              args.tag as string
+            );
+          case "getReleaseById":
+            return await this.getReleaseById(
+              args.owner as string | undefined,
+              args.repo as string | undefined,
+              args.release_id as number
+            );
+          case "listReleases":
+            return await this.listReleases(
+              args.owner as string | undefined,
+              args.repo as string | undefined,
+              args.per_page as number | undefined,
+              args.page as number | undefined,
+              args.all as boolean | undefined
+            );
+          case "downloadReleaseAsset":
+            return await this.downloadReleaseAsset(
+              args.owner as string | undefined,
+              args.repo as string | undefined,
+              args.asset_id as number,
+              args.target_path as string,
+              args.overwrite as boolean | undefined
+            );
+          case "downloadReleaseAssets":
+            return await this.downloadReleaseAssets(
+              args.owner as string | undefined,
+              args.repo as string | undefined,
+              args.release_id_or_tag as string | number,
+              args.target_dir as string,
+              args.pattern as string | undefined,
+              args.overwrite as boolean | undefined
             );
           default:
             throw new McpError(
@@ -5991,6 +6156,371 @@ class GitHubServer {
           "No CODEOWNERS file found in .github/, the repository root, or docs/.",
       });
     });
+  }
+
+  // =========== RELEASE METHODS ===========
+
+  async getLatestRelease(owner?: string, repo?: string) {
+    const ctx = this.resolveContext(owner, repo);
+    return this.guard("getLatestRelease", { ...ctx }, async () => {
+      const response = await this.octokit.rest.repos.getLatestRelease({
+        owner: ctx.owner,
+        repo: ctx.repo,
+      });
+      return this.json(summarizeRelease(response.data));
+    });
+  }
+
+  async getRelease(
+    owner: string | undefined,
+    repo: string | undefined,
+    tag: string
+  ) {
+    if (typeof tag !== "string" || tag.trim().length === 0) {
+      throw new McpError(ErrorCode.InvalidParams, "tag must be a non-empty string");
+    }
+    const ctx = this.resolveContext(owner, repo);
+    return this.guard("getRelease", { ...ctx, tag }, async () => {
+      const response = await this.octokit.rest.repos.getReleaseByTag({
+        owner: ctx.owner,
+        repo: ctx.repo,
+        tag,
+      });
+      return this.json(summarizeRelease(response.data));
+    });
+  }
+
+  async getReleaseById(
+    owner: string | undefined,
+    repo: string | undefined,
+    release_id: number
+  ) {
+    if (typeof release_id !== "number" || !Number.isFinite(release_id)) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        "release_id must be a number"
+      );
+    }
+    const ctx = this.resolveContext(owner, repo);
+    return this.guard(
+      "getReleaseById",
+      { ...ctx, release_id },
+      async () => {
+        const response = await this.octokit.rest.repos.getRelease({
+          owner: ctx.owner,
+          repo: ctx.repo,
+          release_id,
+        });
+        return this.json(summarizeRelease(response.data));
+      }
+    );
+  }
+
+  async listReleases(
+    owner?: string,
+    repo?: string,
+    per_page?: number,
+    page?: number,
+    all?: boolean
+  ) {
+    const ctx = this.resolveContext(owner, repo);
+    return this.guard(
+      "listReleases",
+      { ...ctx, per_page, page, all },
+      async () => {
+        const result = await this.paginator.fetchValues<any>(
+          async (p, pp) =>
+            (
+              await this.octokit.rest.repos.listReleases({
+                owner: ctx.owner,
+                repo: ctx.repo,
+                per_page: pp,
+                page: p,
+              })
+            ).data,
+          { per_page, page, all, description: "listReleases" }
+        );
+        return this.json(result.values.map(summarizeRelease));
+      }
+    );
+  }
+
+  async downloadReleaseAsset(
+    owner: string | undefined,
+    repo: string | undefined,
+    asset_id: number,
+    target_path: string,
+    overwrite?: boolean
+  ) {
+    if (typeof asset_id !== "number" || !Number.isFinite(asset_id)) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        "asset_id must be a number"
+      );
+    }
+    if (typeof target_path !== "string" || target_path.length === 0) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        "target_path must be a non-empty string"
+      );
+    }
+    const ctx = this.resolveContext(owner, repo);
+    return this.guard(
+      "downloadReleaseAsset",
+      { ...ctx, asset_id, target_path, overwrite },
+      async () => {
+        const resolvedPath = resolveTargetPath(
+          target_path,
+          process.cwd(),
+          os.homedir()
+        );
+        await this.ensureParentDir(resolvedPath);
+        this.guardTargetWritable(resolvedPath, overwrite === true);
+
+        const assetMeta = await this.octokit.rest.repos.getReleaseAsset({
+          owner: ctx.owner,
+          repo: ctx.repo,
+          asset_id,
+        });
+        const summary = summarizeReleaseAsset(assetMeta.data);
+        const result = await this.streamAssetToFile(
+          ctx.owner,
+          ctx.repo,
+          asset_id,
+          resolvedPath
+        );
+        return this.json({
+          target_path: resolvedPath,
+          bytes_written: result.bytesWritten,
+          sha256: result.sha256,
+          content_type: result.contentType ?? summary.content_type,
+          asset: {
+            id: summary.id,
+            name: summary.name,
+            size: summary.size,
+          },
+        });
+      }
+    );
+  }
+
+  async downloadReleaseAssets(
+    owner: string | undefined,
+    repo: string | undefined,
+    release_id_or_tag: string | number,
+    target_dir: string,
+    pattern?: string,
+    overwrite?: boolean
+  ) {
+    if (typeof target_dir !== "string" || target_dir.length === 0) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        "target_dir must be a non-empty string"
+      );
+    }
+    let ref: ReturnType<typeof classifyReleaseRef>;
+    try {
+      ref = classifyReleaseRef(release_id_or_tag);
+    } catch (error) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        error instanceof Error ? error.message : String(error)
+      );
+    }
+
+    const ctx = this.resolveContext(owner, repo);
+    return this.guard(
+      "downloadReleaseAssets",
+      { ...ctx, release_id_or_tag, target_dir, pattern, overwrite },
+      async () => {
+        const resolvedDir = resolveTargetPath(
+          target_dir,
+          process.cwd(),
+          os.homedir()
+        );
+        fs.mkdirSync(resolvedDir, { recursive: true });
+
+        const release =
+          ref.kind === "id"
+            ? (
+                await this.octokit.rest.repos.getRelease({
+                  owner: ctx.owner,
+                  repo: ctx.repo,
+                  release_id: ref.id,
+                })
+              ).data
+            : (
+                await this.octokit.rest.repos.getReleaseByTag({
+                  owner: ctx.owner,
+                  repo: ctx.repo,
+                  tag: ref.tag,
+                })
+              ).data;
+
+        const allAssets: ReleaseAssetSummary[] = Array.isArray(release.assets)
+          ? release.assets.map(summarizeReleaseAsset)
+          : [];
+        const matched: ReleaseAssetSummary[] = [];
+        const skipped: ReleaseAssetSummary[] = [];
+        for (const asset of allAssets) {
+          if (matchesPattern(asset.name, pattern)) {
+            matched.push(asset);
+          } else {
+            skipped.push(asset);
+          }
+        }
+
+        const downloads: Array<{
+          asset: { id: number; name: string; size: number };
+          target_path: string;
+          bytes_written: number;
+          sha256: string;
+          content_type: string;
+        }> = [];
+
+        for (const asset of matched) {
+          const targetPath = path.join(resolvedDir, asset.name);
+          this.guardTargetWritable(targetPath, overwrite === true);
+          const result = await this.streamAssetToFile(
+            ctx.owner,
+            ctx.repo,
+            asset.id,
+            targetPath
+          );
+          downloads.push({
+            asset: { id: asset.id, name: asset.name, size: asset.size },
+            target_path: targetPath,
+            bytes_written: result.bytesWritten,
+            sha256: result.sha256,
+            content_type: result.contentType ?? asset.content_type,
+          });
+        }
+
+        return this.json({
+          release: {
+            id: release.id,
+            tag_name: release.tag_name,
+            name: release.name,
+            html_url: release.html_url,
+          },
+          target_dir: resolvedDir,
+          pattern: pattern ?? null,
+          downloads,
+          skipped_no_match: skipped.map((a) => ({ id: a.id, name: a.name })),
+        });
+      }
+    );
+  }
+
+  private async ensureParentDir(filePath: string): Promise<void> {
+    const dir = path.dirname(filePath);
+    if (dir && dir !== filePath) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+  }
+
+  private guardTargetWritable(filePath: string, overwrite: boolean): void {
+    if (!fs.existsSync(filePath)) return;
+    if (overwrite) return;
+    throw new McpError(
+      ErrorCode.InvalidParams,
+      `Refusing to overwrite existing file: ${filePath}. Pass overwrite=true to replace it.`
+    );
+  }
+
+  /**
+   * Stream a release asset to a local file.
+   *
+   * Hits the REST asset endpoint with `Accept: application/octet-stream`,
+   * follows GitHub's redirect to the signed CDN URL (Node's `fetch` does this
+   * automatically), and pipes the response body through a sha256 hasher into
+   * the target file. Nothing is buffered in memory.
+   */
+  private async streamAssetToFile(
+    owner: string,
+    repo: string,
+    asset_id: number,
+    targetPath: string
+  ): Promise<{
+    bytesWritten: number;
+    sha256: string;
+    contentType: string | null;
+  }> {
+    const url = `https://api.github.com/repos/${owner}/${repo}/releases/assets/${asset_id}`;
+    const headers: Record<string, string> = {
+      Accept: "application/octet-stream",
+      "User-Agent": "github-mcp",
+      "X-GitHub-Api-Version": "2022-11-28",
+    };
+    const token = this.config.token;
+    if (token) {
+      headers.Authorization = `Bearer ${token}`;
+    }
+
+    const response = await fetch(url, {
+      method: "GET",
+      headers,
+      redirect: "follow",
+    });
+    if (!response.ok) {
+      const bodyText = await response.text().catch(() => "");
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Asset download failed: HTTP ${response.status} ${response.statusText}${
+          bodyText ? ` — ${bodyText.slice(0, 200)}` : ""
+        }`
+      );
+    }
+    if (!response.body) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        "Asset download returned an empty body"
+      );
+    }
+
+    const hasher = crypto.createHash("sha256");
+    let bytesWritten = 0;
+    const fileStream = fs.createWriteStream(targetPath);
+    const tap = new Writable({
+      write(chunk, _enc, cb) {
+        try {
+          hasher.update(chunk);
+          bytesWritten += chunk.length;
+          if (!fileStream.write(chunk)) {
+            fileStream.once("drain", cb);
+          } else {
+            cb();
+          }
+        } catch (err) {
+          cb(err as Error);
+        }
+      },
+      final(cb) {
+        fileStream.end(cb);
+      },
+    });
+
+    try {
+      // Node's fetch returns a Web ReadableStream; convert it to a Node
+      // Readable so we can pipe it through pipeline() for backpressure +
+      // error propagation.
+      const nodeReadable = Readable.fromWeb(response.body as any);
+      await streamPipeline(nodeReadable, tap);
+    } catch (error) {
+      // Clean up partial file on error.
+      try {
+        fs.unlinkSync(targetPath);
+      } catch {
+        // ignore
+      }
+      throw error;
+    }
+
+    return {
+      bytesWritten,
+      sha256: hasher.digest("hex"),
+      contentType: response.headers.get("content-type"),
+    };
   }
 
   async run() {

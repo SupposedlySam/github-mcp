@@ -292,6 +292,48 @@ checklist positions; deleting a task renumbers the ones after it.
 | `getBranchProtection` | branching-model tools | Defaults to the repo's default branch |
 | `getCodeowners` | `getEffectiveDefaultReviewers` | Parses `.github/CODEOWNERS`, `CODEOWNERS`, or `docs/CODEOWNERS` |
 
+### Releases
+
+Release metadata plus streaming asset downloads. The babysit idiom: a watcher
+script polls `getLatestRelease` (or `listReleases`) for a new tag, then the
+session uses `downloadReleaseAsset` / `downloadReleaseAssets` to pull the
+artifact under test — same shape as `getPullRequestActivity` / `checkPrReplies`
+as doorbell + detail-on-demand.
+
+| Tool | Notes |
+|------|-------|
+| `getLatestRelease` | Latest published, non-draft, non-prerelease release. Convenience wrapper for the common babysit case. 404s when the repo has no published releases. |
+| `getRelease` | Get a release by `tag` (e.g. `v0.3.0`). |
+| `getReleaseById` | Get a release by numeric id. Draft releases require write access. |
+| `listReleases` | Newest first (GitHub's default order). Includes drafts and prereleases. Same `per_page` / `page` / `all` pagination as the other list tools. |
+| `downloadReleaseAsset` | Stream a single asset to a local path. See the path-resolution and overwrite rules below. Returns `{ bytes_written, sha256, content_type, target_path, asset }`. |
+| `downloadReleaseAssets` | Stream multiple assets matching an optional glob (or `/regex/flags`) into a directory. Convenient when a release ships per-platform artifacts (`*macos-arm64*`). |
+
+Release shape (from `getRelease` / `getReleaseById` / `getLatestRelease` and
+each entry in `listReleases`): `id`, `node_id`, `tag_name`, `name`, `body`,
+`draft`, `prerelease`, `target_commitish`, `author`, `created_at`,
+`published_at`, `html_url`, `tarball_url`, `zipball_url`, and an `assets[]`
+array each carrying `{ id, name, label, size, content_type, state,
+download_count, browser_download_url, url, created_at, updated_at }`.
+
+**Asset download contract** (both download tools share this):
+
+- **Streaming.** The response body is piped to disk and hashed on the fly — nothing is buffered in memory. Releases that ship 30–50MB+ binaries work fine.
+- **Redirect handling.** The initial `api.github.com` response is a 302 to a signed CDN URL with a different host (`objects.githubusercontent.com`); the tools set `Accept: application/octet-stream` and follow the redirect automatically.
+- **Auth.** The MCP server's `GITHUB_TOKEN` is sent as a Bearer token. Public assets work without auth too; private repos require it.
+- **Path resolution.** Absolute paths are used as-is, `~/...` is expanded to the user's home, and relative paths resolve against the MCP server's `process.cwd()` (i.e. wherever the MCP server was launched from, *not* your shell's cwd). Parent directories are created automatically.
+- **Overwrite is opt-in.** When the target file already exists the call fails with `InvalidParams`; pass `overwrite: true` to replace it. Partial files are removed on stream error.
+- **chmod.** The file is written with the default umask. Callers are responsible for `chmod +x` on binaries — the server does not infer executability.
+- **Pattern matching** (plural tool only). `pattern` is a shell-style glob by default (`*macos-arm64*`, `*.zip`); patterns formatted as `/regex/flags` are compiled as regex. Assets that do not match are returned under `skipped_no_match` so the caller can confirm the filter did what they meant. Omit `pattern` to download every asset.
+- **`release_id_or_tag`** (plural tool only) accepts a number, an all-digit string (also treated as an id), or a tag name (`v0.3.0`). A `v`-prefixed string is unambiguously a tag.
+
+Quirks worth knowing:
+
+- **Draft releases** are returned by `getReleaseById` / `getRelease` only when the token has write access. Public read-only tokens get a 404.
+- **`getLatestRelease` ignores drafts and prereleases** by definition — use `listReleases` (or `getRelease` with the known tag) to inspect prereleases.
+- **Asset `state`** is usually `"uploaded"`; assets still uploading (`"starter"`) return errors when downloaded, but in practice releases ship in a publish-complete state.
+- **Tag names with slashes** (`release/v1`) are URL-encoded automatically by Octokit; you can pass them verbatim.
+
 ### Intentionally dropped (no GitHub analog)
 
 These Bitbucket tools cover the Bitbucket *branching model* concept, which
@@ -341,6 +383,9 @@ credentials or network.
 - `src/repoMove.ts` — renamed/transferred repository handling: recognizing
   the content-length-mismatch failure GitHub's redirect causes on requests
   with a body, and caching old-slug → new-slug mappings for retries.
+- `src/releases.ts` — pure helpers for the Release tools: response shaping,
+  target-path resolution (absolute vs `~`-expanded vs cwd-relative), glob /
+  regex pattern matching for asset filtering, and tag-vs-id classification.
 
 ## License
 

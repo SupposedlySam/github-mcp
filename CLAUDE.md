@@ -42,6 +42,7 @@ Adding a tool means touching all three.
 - `src/codeowners.ts` — CODEOWNERS parsing
 - `src/pendingReview.ts` — pending-review resolution, review-comment draft validation (review batching), and approval planning around existing pending reviews
 - `src/repoMove.ts` — renamed/transferred repo handling: recognizing the content-length-mismatch failure caused by GitHub's redirect on requests with a body, plus the old-slug → new-slug move cache used to rewrite and retry such requests
+- `src/releases.ts` — Release tools' pure helpers: response shaping, target-path resolution (absolute / `~`-expanded / cwd-relative), glob-or-regex pattern matching, and `release_id_or_tag` classification
 
 Repetitive data processing belongs in these modules (code over compute), keeping it testable without network access.
 
