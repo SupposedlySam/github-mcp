@@ -170,6 +170,37 @@ const PULL_NUMBER_SCHEMA = {
   description: "Pull request number",
 };
 
+const ISSUE_NUMBER_SCHEMA = {
+  type: "number",
+  description: "Issue number",
+};
+
+/**
+ * Reaction "content" values accepted by the GitHub Reactions API.
+ * Source: https://docs.github.com/en/rest/reactions/reactions
+ */
+const REACTION_CONTENTS = [
+  "+1",
+  "-1",
+  "laugh",
+  "confused",
+  "heart",
+  "hooray",
+  "rocket",
+  "eyes",
+] as const;
+type ReactionContent = (typeof REACTION_CONTENTS)[number];
+
+/**
+ * GitHub splits reaction endpoints by the comment's parent context. For
+ * comments these are: issue comments (used by Issue conversation AND PR
+ * top-level conversation), PR review (inline) comments, and commit comments.
+ * We expose the first two — they cover everything reachable from issue/PR
+ * comment ids in this MCP.
+ */
+const COMMENT_REACTION_KINDS = ["issue", "pr_review"] as const;
+type CommentReactionKind = (typeof COMMENT_REACTION_KINDS)[number];
+
 // =========== CONFIG ==========
 interface GitHubConfig {
   baseUrl: string;
@@ -268,6 +299,39 @@ function summarizePullRequest(pr: any) {
       ? pr.requested_reviewers.map((r: any) => r.login)
       : undefined,
     html_url: pr.html_url,
+  };
+}
+
+/** Trimmed Issue shape; mirrors summarizePullRequest's keys where they overlap. */
+function summarizeIssue(issue: any) {
+  return {
+    number: issue.number,
+    title: issue.title,
+    state: issue.state,
+    state_reason: issue.state_reason ?? null,
+    author: issue.user?.login,
+    assignees: Array.isArray(issue.assignees)
+      ? issue.assignees.map((a: any) => a.login)
+      : undefined,
+    labels: Array.isArray(issue.labels)
+      ? issue.labels.map((l: any) => (typeof l === "string" ? l : l?.name))
+      : undefined,
+    milestone: issue.milestone?.title ?? null,
+    comments: issue.comments,
+    created_at: issue.created_at,
+    updated_at: issue.updated_at,
+    closed_at: issue.closed_at,
+    html_url: issue.html_url,
+  };
+}
+
+/** Trimmed reaction shape for list outputs. */
+function summarizeReaction(reaction: any) {
+  return {
+    id: reaction.id,
+    user: reaction.user?.login,
+    content: reaction.content,
+    created_at: reaction.created_at,
   };
 }
 
@@ -375,6 +439,21 @@ const ISSUE_COMMENTS_MINIMIZED_QUERY = `
   query IssueCommentsMinimized($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
     repository(owner: $owner, name: $repo) {
       pullRequest(number: $number) {
+        comments(first: 100, after: $cursor) {
+          pageInfo { hasNextPage endCursor }
+          nodes { databaseId isMinimized minimizedReason }
+        }
+      }
+    }
+  }
+`;
+
+// Issue comments (not PRs): same shape, rooted at repository.issue. Used by
+// the Issue-only tools where the comments live on an Issue, not a PR.
+const ISSUE_ONLY_COMMENTS_MINIMIZED_QUERY = `
+  query IssueOnlyCommentsMinimized($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+    repository(owner: $owner, name: $repo) {
+      issue(number: $number) {
         comments(first: 100, after: $cursor) {
           pageInfo { hasNextPage endCursor }
           nodes { databaseId isMinimized minimizedReason }
@@ -1393,6 +1472,249 @@ class GitHubServer {
           },
         },
         {
+          name: "getIssue",
+          description:
+            "Get an Issue by number (state, title, body, author, labels, milestone, assignees, comment count, timestamps). Issue equivalent of getPullRequest.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              ...OWNER_REPO_SCHEMA,
+              issue_number: ISSUE_NUMBER_SCHEMA,
+            },
+            required: ["issue_number"],
+          },
+        },
+        {
+          name: "getIssueActivity",
+          description:
+            "Get the timeline of events for an Issue (comments, label changes, state changes, mentions, etc.). Issue equivalent of getPullRequestActivity. Backed by the same /issues/{n}/timeline endpoint — useful as a 'doorbell' wake for in-session babysitting watchers.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              ...OWNER_REPO_SCHEMA,
+              issue_number: ISSUE_NUMBER_SCHEMA,
+              ...PAGINATION_BASE_SCHEMA,
+              all: PAGINATION_ALL_SCHEMA,
+            },
+            required: ["issue_number"],
+          },
+        },
+        {
+          name: "getIssueComments",
+          description:
+            "List top-level comments on an Issue. Each comment carries is_minimized / minimized_reason (via GraphQL when available). Supports a `since` ISO timestamp cursor — GitHub's REST API filters server-side.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              ...OWNER_REPO_SCHEMA,
+              issue_number: ISSUE_NUMBER_SCHEMA,
+              since: {
+                type: "string",
+                description:
+                  "ISO 8601 timestamp; return only comments updated at or after this time.",
+              },
+              ...PAGINATION_BASE_SCHEMA,
+              all: PAGINATION_ALL_SCHEMA,
+            },
+            required: ["issue_number"],
+          },
+        },
+        {
+          name: "getIssueComment",
+          description:
+            "Get a single Issue comment by id. Backed by the issues/comments REST endpoint (the same shape used by PR top-level conversation comments).",
+          inputSchema: {
+            type: "object",
+            properties: {
+              ...OWNER_REPO_SCHEMA,
+              comment_id: { type: "number", description: "Comment id" },
+            },
+            required: ["comment_id"],
+          },
+        },
+        {
+          name: "addIssueComment",
+          description:
+            "Post a top-level comment on an Issue. Issue equivalent of addPullRequestComment's top-level mode — Issues have no inline/reply analog.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              ...OWNER_REPO_SCHEMA,
+              issue_number: ISSUE_NUMBER_SCHEMA,
+              body: { type: "string", description: "Comment text (markdown)" },
+            },
+            required: ["issue_number", "body"],
+          },
+        },
+        {
+          name: "updateIssueComment",
+          description:
+            "Update the text of an Issue comment. Issue equivalent of updatePullRequestComment.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              ...OWNER_REPO_SCHEMA,
+              comment_id: { type: "number", description: "Comment id" },
+              body: { type: "string", description: "New comment text" },
+            },
+            required: ["comment_id", "body"],
+          },
+        },
+        {
+          name: "deleteIssueComment",
+          description:
+            "Delete an Issue comment. Issue equivalent of deletePullRequestComment.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              ...OWNER_REPO_SCHEMA,
+              comment_id: { type: "number", description: "Comment id" },
+            },
+            required: ["comment_id"],
+          },
+        },
+        {
+          name: "checkIssueReplies",
+          description:
+            "Check Issue comment threads for replies. Default (self) mode finds Issues where the given user has commented and someone else replied after their last comment. `all` mode returns every Issue that has at least one reply after the OP. Issues have no native review-thread concept, so each Issue is treated as a single discussion thread; is_resolved is always null. Identity defaults to the authenticated user's login.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              ...OWNER_REPO_SCHEMA,
+              issue_numbers: {
+                type: "array",
+                items: { type: "number" },
+                description: "Issue numbers to check",
+              },
+              self: {
+                type: "string",
+                description:
+                  "GitHub login to treat as 'self' (defaults to the authenticated user)",
+              },
+              all: {
+                type: "boolean",
+                description:
+                  "Return all Issues with replies instead of only those with new replies to self",
+              },
+            },
+            required: ["issue_numbers"],
+          },
+        },
+        {
+          name: "getCommentReactions",
+          description:
+            "List reactions on a single comment. `kind` says which endpoint to hit — `issue` for Issue conversation comments AND PR top-level conversation comments (they share the issues/comments table); `pr_review` for PR inline review comments. When `kind` is omitted, tries `issue` first then `pr_review`.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              ...OWNER_REPO_SCHEMA,
+              comment_id: { type: "number", description: "Comment id" },
+              kind: {
+                type: "string",
+                enum: [...COMMENT_REACTION_KINDS],
+                description:
+                  "Comment kind: 'issue' (Issue or PR top-level conversation comment) or 'pr_review' (PR inline review comment). Auto-detected when omitted.",
+              },
+              content: {
+                type: "string",
+                enum: [...REACTION_CONTENTS],
+                description: "Optional filter: only return reactions of this content.",
+              },
+              ...PAGINATION_BASE_SCHEMA,
+              all: PAGINATION_ALL_SCHEMA,
+            },
+            required: ["comment_id"],
+          },
+        },
+        {
+          name: "getIssueReactions",
+          description:
+            "List reactions on the body of an Issue (the OP, not its comments).",
+          inputSchema: {
+            type: "object",
+            properties: {
+              ...OWNER_REPO_SCHEMA,
+              issue_number: ISSUE_NUMBER_SCHEMA,
+              content: {
+                type: "string",
+                enum: [...REACTION_CONTENTS],
+                description: "Optional filter: only return reactions of this content.",
+              },
+              ...PAGINATION_BASE_SCHEMA,
+              all: PAGINATION_ALL_SCHEMA,
+            },
+            required: ["issue_number"],
+          },
+        },
+        {
+          name: "getPullRequestReactions",
+          description:
+            "List reactions on the body of a Pull Request (the OP, not its comments). Backed by the issues/{n}/reactions endpoint (PR bodies live in the issues table on GitHub).",
+          inputSchema: {
+            type: "object",
+            properties: {
+              ...OWNER_REPO_SCHEMA,
+              pull_number: PULL_NUMBER_SCHEMA,
+              content: {
+                type: "string",
+                enum: [...REACTION_CONTENTS],
+                description: "Optional filter: only return reactions of this content.",
+              },
+              ...PAGINATION_BASE_SCHEMA,
+              all: PAGINATION_ALL_SCHEMA,
+            },
+            required: ["pull_number"],
+          },
+        },
+        {
+          name: "addCommentReaction",
+          description:
+            "Add a reaction to a comment. `kind` follows the same split as getCommentReactions (issue vs pr_review); auto-detected when omitted. `content` is one of: +1, -1, laugh, confused, heart, hooray, rocket, eyes. Idempotent — GitHub returns the existing reaction if the authenticated user already reacted with that content.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              ...OWNER_REPO_SCHEMA,
+              comment_id: { type: "number", description: "Comment id" },
+              content: {
+                type: "string",
+                enum: [...REACTION_CONTENTS],
+                description: "Reaction content",
+              },
+              kind: {
+                type: "string",
+                enum: [...COMMENT_REACTION_KINDS],
+                description:
+                  "Comment kind: 'issue' (Issue or PR top-level conversation comment) or 'pr_review' (PR inline review comment). Auto-detected when omitted.",
+              },
+            },
+            required: ["comment_id", "content"],
+          },
+        },
+        {
+          name: "removeCommentReaction",
+          description:
+            "Remove the authenticated user's reaction of the given content from a comment. `kind` follows the same split as getCommentReactions (issue vs pr_review); auto-detected when omitted.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              ...OWNER_REPO_SCHEMA,
+              comment_id: { type: "number", description: "Comment id" },
+              content: {
+                type: "string",
+                enum: [...REACTION_CONTENTS],
+                description: "Reaction content to remove",
+              },
+              kind: {
+                type: "string",
+                enum: [...COMMENT_REACTION_KINDS],
+                description:
+                  "Comment kind: 'issue' (Issue or PR top-level conversation comment) or 'pr_review' (PR inline review comment). Auto-detected when omitted.",
+              },
+            },
+            required: ["comment_id", "content"],
+          },
+        },
+        {
           name: "getPullRequestTasks",
           description:
             "List PR tasks. GitHub has no native PR task object; tasks are emulated as a markdown checklist in a dedicated, marker-tagged PR comment.",
@@ -2053,6 +2375,112 @@ class GitHubServer {
               args.pull_numbers as number[],
               args.self as string | undefined,
               args.all as boolean | undefined
+            );
+          case "getIssue":
+            return await this.getIssue(
+              args.owner as string | undefined,
+              args.repo as string | undefined,
+              args.issue_number as number
+            );
+          case "getIssueActivity":
+            return await this.getIssueActivity(
+              args.owner as string | undefined,
+              args.repo as string | undefined,
+              args.issue_number as number,
+              args.per_page as number | undefined,
+              args.page as number | undefined,
+              args.all as boolean | undefined
+            );
+          case "getIssueComments":
+            return await this.getIssueComments(
+              args.owner as string | undefined,
+              args.repo as string | undefined,
+              args.issue_number as number,
+              args.since as string | undefined,
+              args.per_page as number | undefined,
+              args.page as number | undefined,
+              args.all as boolean | undefined
+            );
+          case "getIssueComment":
+            return await this.getIssueComment(
+              args.owner as string | undefined,
+              args.repo as string | undefined,
+              args.comment_id as number
+            );
+          case "addIssueComment":
+            return await this.addIssueComment(
+              args.owner as string | undefined,
+              args.repo as string | undefined,
+              args.issue_number as number,
+              args.body as string
+            );
+          case "updateIssueComment":
+            return await this.updateIssueComment(
+              args.owner as string | undefined,
+              args.repo as string | undefined,
+              args.comment_id as number,
+              args.body as string
+            );
+          case "deleteIssueComment":
+            return await this.deleteIssueComment(
+              args.owner as string | undefined,
+              args.repo as string | undefined,
+              args.comment_id as number
+            );
+          case "checkIssueReplies":
+            return await this.checkIssueReplies(
+              args.owner as string | undefined,
+              args.repo as string | undefined,
+              args.issue_numbers as number[],
+              args.self as string | undefined,
+              args.all as boolean | undefined
+            );
+          case "getCommentReactions":
+            return await this.getCommentReactions(
+              args.owner as string | undefined,
+              args.repo as string | undefined,
+              args.comment_id as number,
+              args.kind as CommentReactionKind | undefined,
+              args.content as ReactionContent | undefined,
+              args.per_page as number | undefined,
+              args.page as number | undefined,
+              args.all as boolean | undefined
+            );
+          case "getIssueReactions":
+            return await this.getIssueReactions(
+              args.owner as string | undefined,
+              args.repo as string | undefined,
+              args.issue_number as number,
+              args.content as ReactionContent | undefined,
+              args.per_page as number | undefined,
+              args.page as number | undefined,
+              args.all as boolean | undefined
+            );
+          case "getPullRequestReactions":
+            return await this.getPullRequestReactions(
+              args.owner as string | undefined,
+              args.repo as string | undefined,
+              args.pull_number as number,
+              args.content as ReactionContent | undefined,
+              args.per_page as number | undefined,
+              args.page as number | undefined,
+              args.all as boolean | undefined
+            );
+          case "addCommentReaction":
+            return await this.addCommentReaction(
+              args.owner as string | undefined,
+              args.repo as string | undefined,
+              args.comment_id as number,
+              args.content as ReactionContent,
+              args.kind as CommentReactionKind | undefined
+            );
+          case "removeCommentReaction":
+            return await this.removeCommentReaction(
+              args.owner as string | undefined,
+              args.repo as string | undefined,
+              args.comment_id as number,
+              args.content as ReactionContent,
+              args.kind as CommentReactionKind | undefined
             );
           case "getPullRequestTasks":
             return await this.getPullRequestTasks(
@@ -4006,6 +4434,736 @@ class GitHubServer {
         return this.json(results);
       }
     );
+  }
+
+  // =========== ISSUE METHODS ===========
+
+  async getIssue(
+    owner: string | undefined,
+    repo: string | undefined,
+    issue_number: number
+  ) {
+    const ctx = this.resolveContext(owner, repo);
+    return this.guard("getIssue", { ...ctx, issue_number }, async () => {
+      const response = await this.octokit.rest.issues.get({
+        owner: ctx.owner,
+        repo: ctx.repo,
+        issue_number,
+      });
+      const issue = response.data;
+      // Filter out PRs: GitHub's issues endpoint returns PRs too, but the
+      // distinction matters for callers expecting an actual Issue.
+      if (issue.pull_request) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `#${issue_number} is a pull request, not an Issue. Use getPullRequest instead.`
+        );
+      }
+      return this.json({
+        ...summarizeIssue(issue),
+        body: issue.body,
+        node_id: issue.node_id,
+      });
+    });
+  }
+
+  async getIssueActivity(
+    owner: string | undefined,
+    repo: string | undefined,
+    issue_number: number,
+    per_page?: number,
+    page?: number,
+    all?: boolean
+  ) {
+    const ctx = this.resolveContext(owner, repo);
+    return this.guard(
+      "getIssueActivity",
+      { ...ctx, issue_number, per_page, page, all },
+      async () => {
+        const result = await this.paginator.fetchValues<any>(
+          async (p, pp) =>
+            (
+              await this.octokit.rest.issues.listEventsForTimeline({
+                owner: ctx.owner,
+                repo: ctx.repo,
+                issue_number,
+                per_page: pp,
+                page: p,
+              })
+            ).data,
+          { per_page, page, all, description: "getIssueActivity" }
+        );
+
+        const events = result.values.map((event: any) => ({
+          event: event.event,
+          actor: event.actor?.login ?? event.user?.login,
+          created_at: event.created_at ?? event.submitted_at,
+          state: event.state,
+          label: event.label?.name,
+          assignee: event.assignee?.login,
+          milestone: event.milestone?.title,
+          sha: event.sha,
+          body:
+            typeof event.body === "string" && event.body.length > 500
+              ? `${event.body.slice(0, 500)}…`
+              : event.body,
+        }));
+        return this.json(events);
+      }
+    );
+  }
+
+  async getIssueComments(
+    owner: string | undefined,
+    repo: string | undefined,
+    issue_number: number,
+    since?: string,
+    per_page?: number,
+    page?: number,
+    all?: boolean
+  ) {
+    const ctx = this.resolveContext(owner, repo);
+    return this.guard(
+      "getIssueComments",
+      { ...ctx, issue_number, since, per_page, page, all },
+      async () => {
+        const result = await this.paginator.fetchValues<any>(
+          async (p, pp) =>
+            (
+              await this.octokit.rest.issues.listComments({
+                owner: ctx.owner,
+                repo: ctx.repo,
+                issue_number,
+                per_page: pp,
+                page: p,
+                ...(since ? { since } : {}),
+              })
+            ).data,
+          { per_page, page, all, description: "getIssueComments" }
+        );
+
+        // Issues' minimized state lives only in GraphQL. Best-effort — a
+        // failure leaves the comment list intact with isMinimized=false.
+        let minimized = new Map<number, MinimizedState>();
+        try {
+          minimized = await this.fetchIssueOnlyMinimizedMap(
+            ctx.owner,
+            ctx.repo,
+            issue_number
+          );
+        } catch (error) {
+          logger.warn("Could not fetch Issue comment minimized state", { error });
+        }
+
+        return this.json({
+          comments: result.values.map((c: any) =>
+            summarizeComment(c, minimized.get(c.id))
+          ),
+          counts: {
+            comments: result.values.length,
+          },
+        });
+      }
+    );
+  }
+
+  /**
+   * Map Issue (top-level) comment databaseIds to their hidden ("minimized")
+   * state. Same shape as fetchIssueCommentMinimizedMap but rooted at
+   * `repository.issue` instead of `repository.pullRequest`.
+   */
+  private async fetchIssueOnlyMinimizedMap(
+    owner: string,
+    repo: string,
+    issue_number: number
+  ): Promise<Map<number, MinimizedState>> {
+    const map = new Map<number, MinimizedState>();
+    let cursor: string | null = null;
+    for (;;) {
+      const response: any = await this.octokit.graphql(
+        ISSUE_ONLY_COMMENTS_MINIMIZED_QUERY,
+        { owner, repo, number: issue_number, cursor }
+      );
+      const comments = response?.repository?.issue?.comments;
+      if (!comments) break;
+      for (const node of comments.nodes ?? []) {
+        if (typeof node?.databaseId === "number") {
+          map.set(node.databaseId, {
+            isMinimized: node.isMinimized === true,
+            minimizedReason: node.minimizedReason ?? null,
+          });
+        }
+      }
+      if (!comments.pageInfo?.hasNextPage) break;
+      cursor = comments.pageInfo.endCursor;
+    }
+    return map;
+  }
+
+  async getIssueComment(
+    owner: string | undefined,
+    repo: string | undefined,
+    comment_id: number
+  ) {
+    const ctx = this.resolveContext(owner, repo);
+    return this.guard(
+      "getIssueComment",
+      { ...ctx, comment_id },
+      async () => {
+        const response = await this.octokit.rest.issues.getComment({
+          owner: ctx.owner,
+          repo: ctx.repo,
+          comment_id,
+        });
+        return this.json(summarizeComment(response.data));
+      }
+    );
+  }
+
+  async addIssueComment(
+    owner: string | undefined,
+    repo: string | undefined,
+    issue_number: number,
+    body: string
+  ) {
+    const ctx = this.resolveContext(owner, repo);
+    body = applySignature(body);
+    return this.guard(
+      "addIssueComment",
+      { ...ctx, issue_number },
+      async () => {
+        const response = await this.octokit.rest.issues.createComment({
+          owner: ctx.owner,
+          repo: ctx.repo,
+          issue_number,
+          body,
+        });
+        return this.json(summarizeComment(response.data));
+      }
+    );
+  }
+
+  async updateIssueComment(
+    owner: string | undefined,
+    repo: string | undefined,
+    comment_id: number,
+    body: string
+  ) {
+    const ctx = this.resolveContext(owner, repo);
+    body = applySignature(body);
+    return this.guard(
+      "updateIssueComment",
+      { ...ctx, comment_id },
+      async () => {
+        const response = await this.octokit.rest.issues.updateComment({
+          owner: ctx.owner,
+          repo: ctx.repo,
+          comment_id,
+          body,
+        });
+        return this.json(summarizeComment(response.data));
+      }
+    );
+  }
+
+  async deleteIssueComment(
+    owner: string | undefined,
+    repo: string | undefined,
+    comment_id: number
+  ) {
+    const ctx = this.resolveContext(owner, repo);
+    return this.guard(
+      "deleteIssueComment",
+      { ...ctx, comment_id },
+      async () => {
+        await this.octokit.rest.issues.deleteComment({
+          owner: ctx.owner,
+          repo: ctx.repo,
+          comment_id,
+        });
+        return this.json({ deleted: true, comment_id });
+      }
+    );
+  }
+
+  async checkIssueReplies(
+    owner: string | undefined,
+    repo: string | undefined,
+    issue_numbers: number[],
+    self?: string,
+    all?: boolean
+  ) {
+    const ctx = this.resolveContext(owner, repo);
+    return this.guard(
+      "checkIssueReplies",
+      { ...ctx, issue_numbers, self, all },
+      async () => {
+        const selfLogin =
+          self && self.trim().length > 0
+            ? self.trim().replace(/^@/, "")
+            : await this.getAuthenticatedLogin();
+
+        const results: Record<string, unknown> = {};
+
+        for (const issueNumber of issue_numbers) {
+          const issueResp = await this.paginator.fetchValues<any>(
+            async (p, pp) =>
+              (
+                await this.octokit.rest.issues.listComments({
+                  owner: ctx.owner,
+                  repo: ctx.repo,
+                  issue_number: issueNumber,
+                  per_page: pp,
+                  page: p,
+                })
+              ).data,
+            { all: true, per_page: 100, description: "listIssueComments" }
+          );
+
+          const issueComments: ThreadComment[] = issueResp.values.map(
+            (comment: any) => ({
+              id: comment.id,
+              in_reply_to_id: null,
+              user: { login: comment.user?.login ?? "unknown" },
+              body: comment.body ?? "",
+              created_at: comment.created_at,
+            })
+          );
+
+          // Treat the OP as the thread root so "replies after self" works
+          // when the user is the Issue's author. Fetch the issue head once.
+          let rootComment: ThreadComment | undefined;
+          try {
+            const issueData = (
+              await this.octokit.rest.issues.get({
+                owner: ctx.owner,
+                repo: ctx.repo,
+                issue_number: issueNumber,
+              })
+            ).data;
+            if (!issueData.pull_request) {
+              rootComment = {
+                id: issueData.id,
+                in_reply_to_id: null,
+                user: { login: issueData.user?.login ?? "unknown" },
+                body: issueData.body ?? "",
+                created_at: issueData.created_at,
+              };
+            }
+          } catch (error) {
+            logger.warn("Could not fetch Issue head for reply detection", {
+              error,
+            });
+          }
+
+          const allComments = rootComment
+            ? [rootComment, ...issueComments]
+            : issueComments;
+          const discussion = buildDiscussionThread(allComments);
+          const threads = discussion ? [discussion] : [];
+
+          // Best-effort GraphQL: hidden state of each top-level comment.
+          let issueMinimized = new Map<number, MinimizedState>();
+          try {
+            issueMinimized = await this.fetchIssueOnlyMinimizedMap(
+              ctx.owner,
+              ctx.repo,
+              issueNumber
+            );
+          } catch (error) {
+            logger.warn("Could not fetch GraphQL Issue comment state", { error });
+          }
+
+          const latestMinimized = (thread: CommentThread): MinimizedState => {
+            const latest = thread.comments[thread.comments.length - 1];
+            return (
+              issueMinimized.get(latest.id) ?? {
+                isMinimized: false,
+                minimizedReason: null,
+              }
+            );
+          };
+
+          if (all) {
+            const activeThreads = threads
+              .filter((thread) => thread.comments.length >= 2)
+              .map((thread) => {
+                const root = thread.comments[0];
+                const latest = latestMinimized(thread);
+                return {
+                  thread_id: thread.thread_id,
+                  kind: thread.kind,
+                  location: thread.location,
+                  is_resolved: null,
+                  latest_comment_is_minimized: latest.isMinimized,
+                  latest_comment_minimized_reason: latest.minimizedReason,
+                  root_comment: {
+                    author: root.user.login,
+                    content: root.body,
+                    created_at: root.created_at,
+                  },
+                  replies: thread.comments.slice(1).map((c) => ({
+                    id: c.id,
+                    author: c.user.login,
+                    content: c.body,
+                    created_at: c.created_at,
+                  })),
+                  total_comments: thread.comments.length,
+                };
+              });
+
+            results[issueNumber] = {
+              mode: "all",
+              total_threads: threads.length,
+              active_threads: activeThreads.length,
+              threads: activeThreads,
+            };
+          } else {
+            const summary = findThreadsWithNewReplies(threads, selfLogin);
+            const byId = new Map(threads.map((t) => [t.thread_id, t]));
+            const decorated = summary.threads.map((t) => {
+              const thread = byId.get(t.thread_id);
+              const latest = thread
+                ? latestMinimized(thread)
+                : { isMinimized: false, minimizedReason: null };
+              return {
+                ...t,
+                is_resolved: null,
+                latest_comment_is_minimized: latest.isMinimized,
+                latest_comment_minimized_reason: latest.minimizedReason,
+              };
+            });
+            results[issueNumber] = {
+              mode: "self",
+              self: selfLogin,
+              total_threads: threads.length,
+              ...summary,
+              threads: decorated,
+            };
+          }
+        }
+
+        return this.json(results);
+      }
+    );
+  }
+
+  // =========== REACTION METHODS ===========
+
+  /**
+   * Try the `issue` reactions endpoint first, then fall back to `pr_review`
+   * when comment_type was not specified. Returns the kind that succeeded so
+   * the caller can label the response.
+   */
+  private async listReactionsForComment(
+    owner: string,
+    repo: string,
+    comment_id: number,
+    kind: CommentReactionKind | undefined,
+    content: ReactionContent | undefined,
+    options: { per_page?: number; page?: number; all?: boolean }
+  ): Promise<{ kind: CommentReactionKind; reactions: any[] }> {
+    const tryIssue = async () =>
+      this.paginator.fetchValues<any>(
+        async (p, pp) =>
+          (
+            await this.octokit.rest.reactions.listForIssueComment({
+              owner,
+              repo,
+              comment_id,
+              per_page: pp,
+              page: p,
+              ...(content ? { content } : {}),
+            })
+          ).data,
+        { ...options, description: "listReactionsForIssueComment" }
+      );
+
+    const tryPrReview = async () =>
+      this.paginator.fetchValues<any>(
+        async (p, pp) =>
+          (
+            await this.octokit.rest.reactions.listForPullRequestReviewComment({
+              owner,
+              repo,
+              comment_id,
+              per_page: pp,
+              page: p,
+              ...(content ? { content } : {}),
+            })
+          ).data,
+        { ...options, description: "listReactionsForPullRequestReviewComment" }
+      );
+
+    if (kind === "pr_review") {
+      const result = await tryPrReview();
+      return { kind: "pr_review", reactions: result.values };
+    }
+
+    try {
+      const result = await tryIssue();
+      return { kind: "issue", reactions: result.values };
+    } catch (error) {
+      const canFallBack =
+        kind === undefined && isRequestError(error) && error.status === 404;
+      if (!canFallBack) throw error;
+    }
+    const result = await tryPrReview();
+    return { kind: "pr_review", reactions: result.values };
+  }
+
+  async getCommentReactions(
+    owner: string | undefined,
+    repo: string | undefined,
+    comment_id: number,
+    kind?: CommentReactionKind,
+    content?: ReactionContent,
+    per_page?: number,
+    page?: number,
+    all?: boolean
+  ) {
+    const ctx = this.resolveContext(owner, repo);
+    return this.guard(
+      "getCommentReactions",
+      { ...ctx, comment_id, kind, content, per_page, page, all },
+      async () => {
+        const result = await this.listReactionsForComment(
+          ctx.owner,
+          ctx.repo,
+          comment_id,
+          kind,
+          content,
+          { per_page, page, all }
+        );
+        return this.json({
+          comment_id,
+          kind: result.kind,
+          reactions: result.reactions.map(summarizeReaction),
+          counts: { reactions: result.reactions.length },
+        });
+      }
+    );
+  }
+
+  async getIssueReactions(
+    owner: string | undefined,
+    repo: string | undefined,
+    issue_number: number,
+    content?: ReactionContent,
+    per_page?: number,
+    page?: number,
+    all?: boolean
+  ) {
+    const ctx = this.resolveContext(owner, repo);
+    return this.guard(
+      "getIssueReactions",
+      { ...ctx, issue_number, content, per_page, page, all },
+      async () => {
+        const result = await this.paginator.fetchValues<any>(
+          async (p, pp) =>
+            (
+              await this.octokit.rest.reactions.listForIssue({
+                owner: ctx.owner,
+                repo: ctx.repo,
+                issue_number,
+                per_page: pp,
+                page: p,
+                ...(content ? { content } : {}),
+              })
+            ).data,
+          { per_page, page, all, description: "getIssueReactions" }
+        );
+        return this.json({
+          issue_number,
+          reactions: result.values.map(summarizeReaction),
+          counts: { reactions: result.values.length },
+        });
+      }
+    );
+  }
+
+  async getPullRequestReactions(
+    owner: string | undefined,
+    repo: string | undefined,
+    pull_number: number,
+    content?: ReactionContent,
+    per_page?: number,
+    page?: number,
+    all?: boolean
+  ) {
+    const ctx = this.resolveContext(owner, repo);
+    // PR bodies live in the issues table on GitHub; the reactions endpoint
+    // for the PR body is /issues/{n}/reactions, not /pulls/.
+    return this.guard(
+      "getPullRequestReactions",
+      { ...ctx, pull_number, content, per_page, page, all },
+      async () => {
+        const result = await this.paginator.fetchValues<any>(
+          async (p, pp) =>
+            (
+              await this.octokit.rest.reactions.listForIssue({
+                owner: ctx.owner,
+                repo: ctx.repo,
+                issue_number: pull_number,
+                per_page: pp,
+                page: p,
+                ...(content ? { content } : {}),
+              })
+            ).data,
+          { per_page, page, all, description: "getPullRequestReactions" }
+        );
+        return this.json({
+          pull_number,
+          reactions: result.values.map(summarizeReaction),
+          counts: { reactions: result.values.length },
+        });
+      }
+    );
+  }
+
+  async addCommentReaction(
+    owner: string | undefined,
+    repo: string | undefined,
+    comment_id: number,
+    content: ReactionContent,
+    kind?: CommentReactionKind
+  ) {
+    const ctx = this.resolveContext(owner, repo);
+    return this.guard(
+      "addCommentReaction",
+      { ...ctx, comment_id, content, kind },
+      async () => {
+        if (!(REACTION_CONTENTS as readonly string[]).includes(content)) {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            `Invalid reaction content '${content}'. Expected one of: ${REACTION_CONTENTS.join(", ")}`
+          );
+        }
+        const resolved = await this.addReactionWithFallback(
+          ctx.owner,
+          ctx.repo,
+          comment_id,
+          content,
+          kind
+        );
+        return this.json({
+          comment_id,
+          kind: resolved.kind,
+          ...summarizeReaction(resolved.reaction),
+        });
+      }
+    );
+  }
+
+  async removeCommentReaction(
+    owner: string | undefined,
+    repo: string | undefined,
+    comment_id: number,
+    content: ReactionContent,
+    kind?: CommentReactionKind
+  ) {
+    const ctx = this.resolveContext(owner, repo);
+    return this.guard(
+      "removeCommentReaction",
+      { ...ctx, comment_id, content, kind },
+      async () => {
+        if (!(REACTION_CONTENTS as readonly string[]).includes(content)) {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            `Invalid reaction content '${content}'. Expected one of: ${REACTION_CONTENTS.join(", ")}`
+          );
+        }
+        // GitHub's "delete by user+content" endpoint requires the reaction id.
+        // List the user's reactions of that content on the comment, then
+        // delete the one belonging to the authenticated user.
+        const selfLogin = await this.getAuthenticatedLogin();
+        const listed = await this.listReactionsForComment(
+          ctx.owner,
+          ctx.repo,
+          comment_id,
+          kind,
+          content,
+          { all: true }
+        );
+        const own = listed.reactions.find(
+          (r: any) => r.user?.login === selfLogin
+        );
+        if (!own) {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            `No '${content}' reaction by ${selfLogin} on comment ${comment_id}`
+          );
+        }
+        if (listed.kind === "pr_review") {
+          await this.octokit.rest.reactions.deleteForPullRequestComment({
+            owner: ctx.owner,
+            repo: ctx.repo,
+            comment_id,
+            reaction_id: own.id,
+          });
+        } else {
+          await this.octokit.rest.reactions.deleteForIssueComment({
+            owner: ctx.owner,
+            repo: ctx.repo,
+            comment_id,
+            reaction_id: own.id,
+          });
+        }
+        return this.json({
+          deleted: true,
+          comment_id,
+          kind: listed.kind,
+          reaction_id: own.id,
+          content,
+        });
+      }
+    );
+  }
+
+  /**
+   * Post a reaction to a comment, with the same kind disambiguation strategy
+   * as listReactionsForComment: try `issue` first, fall back to `pr_review`
+   * on 404 when kind was not specified.
+   */
+  private async addReactionWithFallback(
+    owner: string,
+    repo: string,
+    comment_id: number,
+    content: ReactionContent,
+    kind: CommentReactionKind | undefined
+  ): Promise<{ kind: CommentReactionKind; reaction: any }> {
+    if (kind === "pr_review") {
+      const response =
+        await this.octokit.rest.reactions.createForPullRequestReviewComment({
+          owner,
+          repo,
+          comment_id,
+          content,
+        });
+      return { kind: "pr_review", reaction: response.data };
+    }
+
+    try {
+      const response = await this.octokit.rest.reactions.createForIssueComment({
+        owner,
+        repo,
+        comment_id,
+        content,
+      });
+      return { kind: "issue", reaction: response.data };
+    } catch (error) {
+      const canFallBack =
+        kind === undefined && isRequestError(error) && error.status === 404;
+      if (!canFallBack) throw error;
+    }
+    const response =
+      await this.octokit.rest.reactions.createForPullRequestReviewComment({
+        owner,
+        repo,
+        comment_id,
+        content,
+      });
+    return { kind: "pr_review", reaction: response.data };
   }
 
   // =========== TASK METHODS (markdown checklist emulation) ===========

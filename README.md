@@ -161,6 +161,41 @@ Every tool accepts optional `owner`/`repo` (defaulting to
 | `unminimizePullRequestComment` | — | Un-collapse a minimized comment (GraphQL `unminimizeComment`) |
 | `checkPrReplies` | `checkPrReplies` | Finds threads with replies newer than your last comment; identity defaults to the authenticated user's login. Each thread carries `is_resolved` and the latest comment's `latest_comment_is_minimized` / `latest_comment_minimized_reason` |
 
+### Issues
+
+Issue-side parallel to the PR tools above. The babysit/watcher idiom that
+works for PRs (`getPullRequestActivity` as a doorbell, `checkPrReplies` as
+detail-on-demand) maps cleanly to Issues with the same shapes.
+
+| Tool | Notes |
+|------|-------|
+| `getIssue` | Issue equivalent of `getPullRequest`. Rejects when `#n` is actually a PR (GitHub's issues endpoint returns both). |
+| `getIssueActivity` | Issue equivalent of `getPullRequestActivity` (timeline events: comments, label/assignee/milestone changes, state changes). |
+| `getIssueComments` | List top-level comments. Supports server-side `since` ISO timestamp cursor. Each comment carries `is_minimized` / `minimized_reason` via GraphQL. |
+| `getIssueComment` | Single comment by id. |
+| `addIssueComment` | Post a top-level comment. Issues have no inline/reply analog. |
+| `updateIssueComment` | |
+| `deleteIssueComment` | |
+| `checkIssueReplies` | Same shape as `checkPrReplies` but for Issues. Each Issue is a single discussion thread (the OP plus comments); `is_resolved` is always `null`. |
+
+### Reactions
+
+Emoji-reaction signaling that GitHub uses for lightweight ack ("👀 looking",
+"👍 done", "🚀 shipped"). Reactions are not exposed by the comment/activity
+endpoints, so the watcher needs these to diff client-side.
+
+| Tool | Notes |
+|------|-------|
+| `getCommentReactions` | Reactions on a single comment. `kind`: `issue` (Issue *or* PR top-level conversation comment — they share the issues/comments table) or `pr_review` (PR inline review comment). Auto-detected with a 404 fallback when omitted. Optional `content` filter. |
+| `getIssueReactions` | Reactions on the Issue body itself. |
+| `getPullRequestReactions` | Reactions on the PR body itself (backed by `/issues/{n}/reactions` — PR bodies live in the issues table). |
+| `addCommentReaction` | Idempotent — GitHub returns the existing reaction when you already reacted with that content. |
+| `removeCommentReaction` | Removes the authenticated user's reaction of the given content (looks up the reaction id first because GitHub's delete endpoint takes a reaction id, not user+content). |
+
+Reaction `content` values: `+1`, `-1`, `laugh`, `confused`, `heart`,
+`hooray`, `rocket`, `eyes` (matches GitHub's [Reactions API](https://docs.github.com/en/rest/reactions/reactions)).
+The `squirrel-girl` preview header is no longer required as of 2020.
+
 ### Review batching
 
 These tools post multiple review comments as **one review** — the PR author
