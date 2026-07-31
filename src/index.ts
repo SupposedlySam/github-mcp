@@ -72,6 +72,7 @@ import {
 import crypto from "crypto";
 import { pipeline as streamPipeline } from "stream/promises";
 import { Readable, Writable } from "stream";
+import { countReviewStates, summarizeReview } from "./reviews.js";
 
 // Load a gitignored `.env` from the project root before any process.env reads.
 // process.env always wins; `.env` only fills in unset variables.
@@ -469,6 +470,20 @@ const ISSUE_ONLY_COMMENTS_MINIMIZED_QUERY = `
           pageInfo { hasNextPage endCursor }
           nodes { databaseId isMinimized minimizedReason }
         }
+      }
+    }
+  }
+`;
+
+// reviewDecision (APPROVED / CHANGES_REQUESTED / REVIEW_REQUIRED / null) and
+// mergeStateStatus (CLEAN / BLOCKED / BEHIND / …) are GraphQL-only; the REST
+// pulls.get payload omits both.
+const PR_REVIEW_DECISION_QUERY = `
+  query PrReviewDecision($owner: String!, $repo: String!, $number: Int!) {
+    repository(owner: $owner, name: $repo) {
+      pullRequest(number: $number) {
+        reviewDecision
+        mergeStateStatus
       }
     }
   }
@@ -911,12 +926,28 @@ class GitHubServer {
         },
         {
           name: "getPullRequest",
-          description: "Get details for a specific pull request",
+          description:
+            "Get details for a specific pull request, including review_decision (APPROVED / CHANGES_REQUESTED / REVIEW_REQUIRED / null) and merge_state_status from GraphQL. review_decision reflects only APPROVED/CHANGES_REQUESTED reviews — a COMMENTED review (e.g. a bot re-review posting a finding) leaves it null; use getPullRequestReviews to see every review submission's state and body.",
           inputSchema: {
             type: "object",
             properties: {
               ...OWNER_REPO_SCHEMA,
               pull_number: PULL_NUMBER_SCHEMA,
+            },
+            required: ["pull_number"],
+          },
+        },
+        {
+          name: "getPullRequestReviews",
+          description:
+            "List every submitted review on a pull request (Approve / Request changes / Comment / Dismissed / Pending). Each review returns id, author, state (APPROVED / CHANGES_REQUESTED / COMMENTED / DISMISSED / PENDING), body, submitted_at, and commit_id (the head SHA the review covered). This is the ONLY tool that surfaces COMMENTED reviews — a reviewer or bot who submits \"Comment\" rather than Approve/Request-changes does not move review_decision and is invisible to getPullRequestComments. Use this to catch blocking findings posted in a review body.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              ...OWNER_REPO_SCHEMA,
+              pull_number: PULL_NUMBER_SCHEMA,
+              ...PAGINATION_BASE_SCHEMA,
+              all: PAGINATION_ALL_SCHEMA,
             },
             required: ["pull_number"],
           },
@@ -1238,7 +1269,7 @@ class GitHubServer {
         {
           name: "getPullRequestComments",
           description:
-            "Get all comments on a pull request: top-level conversation (issue) comments plus inline review comments grouped into threads. Each comment includes is_minimized and minimized_reason (e.g. \"OUTDATED\"/\"RESOLVED\", null when visible). Each review thread includes is_resolved and is_outdated.",
+            "Get all comments on a pull request: top-level conversation (issue) comments plus inline review comments grouped into threads. Each comment includes is_minimized and minimized_reason (e.g. \"OUTDATED\"/\"RESOLVED\", null when visible). Each review thread includes is_resolved and is_outdated. NOTE: this returns only issue-comments and inline review threads — it does NOT return review submissions (Approve / Request changes / Comment). A COMMENTED review's body (e.g. a bot re-review finding) is invisible here; use getPullRequestReviews for review states and bodies.",
           inputSchema: {
             type: "object",
             properties: {
@@ -2308,6 +2339,17 @@ class GitHubServer {
               args.repo as string | undefined,
               args.pull_number as number
             );
+          case "getPullRequestReviews":
+            return await this.getPullRequestReviews(
+              args.owner as string | undefined,
+              args.repo as string | undefined,
+              args.pull_number as number,
+              {
+                per_page: args.per_page as number | undefined,
+                page: args.page as number | undefined,
+                all: args.all as boolean | undefined,
+              }
+            );
           case "updatePullRequest":
             return await this.updatePullRequest(
               args.owner as string | undefined,
@@ -3073,11 +3115,23 @@ class GitHubServer {
         pull_number,
       });
       const pr = response.data;
+      // reviewDecision/mergeStateStatus are GraphQL-only; fetch best-effort so
+      // a GraphQL failure never sinks the REST result. reviewDecision reflects
+      // only APPROVED/CHANGES_REQUESTED reviews — a COMMENTED review (a bot
+      // re-review finding, or a "Comment" submission) leaves it null. Use
+      // getPullRequestReviews to see every review's state and body.
+      const decision = await this.fetchPrReviewDecision(
+        ctx.owner,
+        ctx.repo,
+        pull_number
+      );
       return this.json({
         ...summarizePullRequest(pr),
         body: pr.body,
         mergeable: pr.mergeable,
         mergeable_state: pr.mergeable_state,
+        review_decision: decision.reviewDecision,
+        merge_state_status: decision.mergeStateStatus,
         merged_by: pr.merged_by?.login,
         comments: pr.comments,
         review_comments: pr.review_comments,
@@ -3089,6 +3143,72 @@ class GitHubServer {
         node_id: pr.node_id,
       });
     });
+  }
+
+  /**
+   * Fetch a PR's GraphQL-only reviewDecision and mergeStateStatus. Best-effort:
+   * returns nulls (with a warning) if the GraphQL call fails so the caller's
+   * REST result still comes back.
+   */
+  private async fetchPrReviewDecision(
+    owner: string,
+    repo: string,
+    pull_number: number
+  ): Promise<{
+    reviewDecision: string | null;
+    mergeStateStatus: string | null;
+  }> {
+    try {
+      const response: any = await this.octokit.graphql(
+        PR_REVIEW_DECISION_QUERY,
+        { owner, repo, number: pull_number }
+      );
+      const node = response?.repository?.pullRequest;
+      return {
+        reviewDecision: node?.reviewDecision ?? null,
+        mergeStateStatus: node?.mergeStateStatus ?? null,
+      };
+    } catch (error) {
+      logger.warn("Could not fetch reviewDecision/mergeStateStatus", { error });
+      return { reviewDecision: null, mergeStateStatus: null };
+    }
+  }
+
+  async getPullRequestReviews(
+    owner: string | undefined,
+    repo: string | undefined,
+    pull_number: number,
+    pagination: { per_page?: number; page?: number; all?: boolean } = {}
+  ) {
+    const ctx = this.resolveContext(owner, repo);
+    const { per_page, page, all } = pagination;
+    return this.guard(
+      "getPullRequestReviews",
+      { ...ctx, pull_number, per_page, page, all },
+      async () => {
+        const result = await this.paginator.fetchValues<any>(
+          async (p, pp) =>
+            (
+              await this.octokit.rest.pulls.listReviews({
+                owner: ctx.owner,
+                repo: ctx.repo,
+                pull_number,
+                per_page: pp,
+                page: p,
+              })
+            ).data,
+          { per_page, page, all, description: "getPullRequestReviews" }
+        );
+        const reviews = result.values.map(summarizeReview);
+        return this.json({
+          reviews,
+          counts: {
+            total: reviews.length,
+            by_state: countReviewStates(reviews),
+          },
+        });
+      }
+    );
   }
 
   async updatePullRequest(
