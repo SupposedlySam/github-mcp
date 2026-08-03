@@ -12,7 +12,7 @@ import winston from "winston";
 import os from "os";
 import path from "path";
 import fs from "fs";
-import { fileURLToPath } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
 import {
   GitHubPaginator,
   GITHUB_ALL_ITEMS_CAP,
@@ -3278,11 +3278,13 @@ class GitHubServer {
       { ...ctx, pull_number },
       async () => {
         if (message && message.trim().length > 0) {
+          // Signed here rather than up front so a blank message still means
+          // "post no comment" instead of posting a bare signature.
           await this.octokit.rest.issues.createComment({
             owner: ctx.owner,
             repo: ctx.repo,
             issue_number: pull_number,
-            body: message,
+            body: applySignature(message),
           });
         }
         const response = await this.octokit.rest.pulls.update({
@@ -3303,6 +3305,9 @@ class GitHubServer {
     body?: string
   ) {
     const ctx = this.resolveContext(owner, repo);
+    // Sign once, before dispatch, so every path (fresh review, existing
+    // pending review, orphan recovery) posts the signed body.
+    body = applySignature(body);
     return this.guard(
       "approvePullRequest",
       { ...ctx, pull_number },
@@ -3485,7 +3490,9 @@ class GitHubServer {
           repo: ctx.repo,
           pull_number,
           review_id: latest.id,
-          message: message ?? "Approval withdrawn",
+          // The dismissal always carries a message, so sign the resolved
+          // value — the default included.
+          message: applySignature(message ?? "Approval withdrawn"),
         });
         return this.json({
           dismissed_review_id: latest.id,
@@ -6650,9 +6657,28 @@ class GitHubServer {
   }
 }
 
+export { GitHubServer };
+
+/**
+ * True when this module is the process entry point (as opposed to being
+ * imported). Symlinked entry paths (e.g. an npm bin shim) are resolved to
+ * their real location before comparing.
+ */
+function isDirectRun(): boolean {
+  const entryPath = process.argv[1];
+  if (!entryPath) return false;
+  try {
+    return import.meta.url === pathToFileURL(fs.realpathSync(entryPath)).href;
+  } catch {
+    return false;
+  }
+}
+
 // Create and start the server
-const server = new GitHubServer();
-server.run().catch((error) => {
-  logger.error("Server error", error);
-  process.exit(1);
-});
+if (isDirectRun()) {
+  const server = new GitHubServer();
+  server.run().catch((error) => {
+    logger.error("Server error", error);
+    process.exit(1);
+  });
+}

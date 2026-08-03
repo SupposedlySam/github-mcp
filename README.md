@@ -68,14 +68,24 @@ GITHUB_COMMENT_SIGNATURE=🤖 via Example MCP bot
 It applies to:
 
 - `addPullRequestComment` — top-level, inline, and reply bodies.
+- `updatePullRequestComment` — the edited body.
+- `addIssueComment` / `updateIssueComment` — the comment body.
 - `createPullRequestReview` — the top-level review summary `body` only (never
   the inline `comments[]`).
 - `submitPullRequestReview` — the `body`, when one is provided.
+- `approvePullRequest` — the `body`, when one is provided (a bodyless approval
+  stays bodyless — the signature is never posted on its own).
+- `closePullRequest` — the optional close comment, when one is provided.
+- `unapprovePullRequest` — the dismissal message, the default
+  ("Approval withdrawn") included.
 
 It does **not** apply to:
 
 - `addCommentToPendingReview` — these are inline drafts within a batch; the
   eventual review body carries the signature instead.
+- The managed PR tasks comment (`createPullRequestTask` and friends) — its
+  body is machine-serialized state, round-tripped verbatim.
+- PR titles/descriptions, and merge/commit messages.
 - Any other tool.
 
 Appending is idempotent: if a body already ends with the signature (trimmed
