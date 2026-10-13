@@ -131,6 +131,13 @@ If `GITHUB_TOKEN` is omitted, the server uses `gh auth token`.
 Every tool accepts optional `owner`/`repo` (defaulting to
 `GITHUB_OWNER`/`GITHUB_REPO`).
 
+Arguments are validated against the tool's `inputSchema` before anything
+reaches GitHub. A missing required parameter, an unknown key, a wrong type
+or an out-of-range value fails with `InvalidParams` naming the parameter,
+and a casing variant of a real key gets a suggestion
+(`unknown parameter \`pullNumber\`; did you mean \`pull_number\`?`).
+`null` on an optional parameter is treated as omitted.
+
 ### Repositories
 
 | Tool | Bitbucket equivalent | Notes |
@@ -377,6 +384,9 @@ credentials or network.
 - `src/index.ts` — the server: tool definitions, the call-tool routing
   switch, and one implementation method per tool (same three insertion
   points as bitbucket-mcp).
+- `src/argValidation.ts` — validates call arguments against each tool's
+  `inputSchema` (required keys, unknown keys with casing suggestions, types,
+  enums, bounds).
 - `src/pagination.ts` — page walker with an `all` mode capped at 1000 items.
 - `src/auth.ts` — `GITHUB_TOKEN` → `gh auth token` resolution.
 - `src/searchQuery.ts` — search-API query builders (author/state filters,

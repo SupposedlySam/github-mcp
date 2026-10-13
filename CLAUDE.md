@@ -32,6 +32,7 @@ Adding a tool means touching all three.
 
 ### Helper modules (pure, unit-tested)
 
+- `src/argValidation.ts` — validates `tools/call` arguments against the tool's `inputSchema` before routing; unknown keys are rejected (with a casing suggestion such as `pullNumber` → `pull_number`), so a handler must never read an argument its schema does not declare
 - `src/pagination.ts` — `GitHubPaginator`: single page or `all` mode (walks pages, caps at 1000 items)
 - `src/auth.ts` — token resolution: `GITHUB_TOKEN` env var, then `gh auth token`
 - `src/searchQuery.ts` — search-API query builders (author/state PR filters, pending-review queries)
@@ -57,5 +58,5 @@ Repetitive data processing belongs in these modules (code over compute), keeping
 
 ## Git
 
-- Trunk-based development on `master`; conventional commits without scope (e.g. `feat: add review tools`)
+- Trunk-based development on `main`; conventional commits without scope (e.g. `feat: add review tools`)
 - This is a personal project: keep real names, logins, and work email addresses out of code, docs, examples, and fixtures — use generic placeholders (octocat, example-org)

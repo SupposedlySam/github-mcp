@@ -73,6 +73,11 @@ import crypto from "crypto";
 import { pipeline as streamPipeline } from "stream/promises";
 import { Readable, Writable } from "stream";
 import { countReviewStates, summarizeReview } from "./reviews.js";
+import {
+  ArgSchema,
+  formatArgumentErrors,
+  validateToolArguments,
+} from "./argValidation.js";
 
 // Load a gitignored `.env` from the project root before any process.env reads.
 // process.env always wins; `.env` only fills in unset variables.
@@ -790,1467 +795,1475 @@ class GitHubServer {
     }
   }
 
-  private setupToolHandlers() {
-    // Register the list tools handler
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: [
-        {
-          name: "listRepositories",
-          description:
-            "List repositories for an owner (organization or user). Supports a client-side partial name filter.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              owner: OWNER_REPO_SCHEMA.owner,
-              name: {
-                type: "string",
-                description:
-                  "Filter repositories by name (partial match, case-insensitive)",
-              },
-              ...PAGINATION_BASE_SCHEMA,
-              all: PAGINATION_ALL_SCHEMA,
+  private toolDefinitions() {
+    return [
+      {
+        name: "listRepositories",
+        description:
+          "List repositories for an owner (organization or user). Supports a client-side partial name filter.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            owner: OWNER_REPO_SCHEMA.owner,
+            name: {
+              type: "string",
+              description:
+                "Filter repositories by name (partial match, case-insensitive)",
+            },
+            ...PAGINATION_BASE_SCHEMA,
+            all: PAGINATION_ALL_SCHEMA,
+          },
+        },
+      },
+      {
+        name: "getRepository",
+        description: "Get repository details",
+        inputSchema: {
+          type: "object",
+          properties: { ...OWNER_REPO_SCHEMA },
+        },
+      },
+      {
+        name: "getPullRequests",
+        description:
+          "Get pull requests for a repository. Supports an optional `author` filter (GitHub login) and a `state` filter (open, closed, merged, all). Author and merged filters are pushed server-side via the GitHub search API so callers avoid fetching every PR and filtering client-side.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            state: {
+              type: "string",
+              enum: ["open", "closed", "merged", "all"],
+              description:
+                "Pull request state. `closed` includes merged PRs; `merged` matches only merged PRs (search API). Defaults to open.",
+            },
+            author: {
+              type: "string",
+              description:
+                "Optional author filter: a GitHub login (with or without a leading @). Server-side via the search API.",
+            },
+            ...PAGINATION_BASE_SCHEMA,
+            all: PAGINATION_ALL_SCHEMA,
+          },
+        },
+      },
+      {
+        name: "createPullRequest",
+        description: "Create a new pull request",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            title: { type: "string", description: "Pull request title" },
+            body: {
+              type: "string",
+              description: "Pull request description (markdown)",
+            },
+            head: {
+              type: "string",
+              description:
+                "Source branch name (use `user:branch` for cross-fork PRs)",
+            },
+            base: { type: "string", description: "Target branch name" },
+            reviewers: {
+              type: "array",
+              items: { type: "string" },
+              description: "List of reviewer logins to request",
+            },
+            draft: {
+              type: "boolean",
+              description: "Whether to create the pull request as a draft",
             },
           },
+          required: ["title", "head", "base"],
         },
-        {
-          name: "getRepository",
-          description: "Get repository details",
-          inputSchema: {
-            type: "object",
-            properties: { ...OWNER_REPO_SCHEMA },
-          },
-        },
-        {
-          name: "getPullRequests",
-          description:
-            "Get pull requests for a repository. Supports an optional `author` filter (GitHub login) and a `state` filter (open, closed, merged, all). Author and merged filters are pushed server-side via the GitHub search API so callers avoid fetching every PR and filtering client-side.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              state: {
-                type: "string",
-                enum: ["open", "closed", "merged", "all"],
-                description:
-                  "Pull request state. `closed` includes merged PRs; `merged` matches only merged PRs (search API). Defaults to open.",
-              },
-              author: {
-                type: "string",
-                description:
-                  "Optional author filter: a GitHub login (with or without a leading @). Server-side via the search API.",
-              },
-              ...PAGINATION_BASE_SCHEMA,
-              all: PAGINATION_ALL_SCHEMA,
+      },
+      {
+        name: "createDraftPullRequest",
+        description: "Create a new draft pull request",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            title: { type: "string", description: "Pull request title" },
+            body: {
+              type: "string",
+              description: "Pull request description (markdown)",
+            },
+            head: { type: "string", description: "Source branch name" },
+            base: { type: "string", description: "Target branch name" },
+            reviewers: {
+              type: "array",
+              items: { type: "string" },
+              description: "List of reviewer logins to request",
             },
           },
+          required: ["title", "head", "base"],
         },
-        {
-          name: "createPullRequest",
-          description: "Create a new pull request",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              title: { type: "string", description: "Pull request title" },
-              body: {
-                type: "string",
-                description: "Pull request description (markdown)",
-              },
-              head: {
-                type: "string",
-                description:
-                  "Source branch name (use `user:branch` for cross-fork PRs)",
-              },
-              base: { type: "string", description: "Target branch name" },
-              reviewers: {
-                type: "array",
-                items: { type: "string" },
-                description: "List of reviewer logins to request",
-              },
-              draft: {
-                type: "boolean",
-                description: "Whether to create the pull request as a draft",
-              },
-            },
-            required: ["title", "head", "base"],
+      },
+      {
+        name: "publishDraftPullRequest",
+        description:
+          "Mark a draft pull request as ready for review (GraphQL markPullRequestReadyForReview)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            pull_number: PULL_NUMBER_SCHEMA,
           },
+          required: ["pull_number"],
         },
-        {
-          name: "createDraftPullRequest",
-          description: "Create a new draft pull request",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              title: { type: "string", description: "Pull request title" },
-              body: {
-                type: "string",
-                description: "Pull request description (markdown)",
-              },
-              head: { type: "string", description: "Source branch name" },
-              base: { type: "string", description: "Target branch name" },
-              reviewers: {
-                type: "array",
-                items: { type: "string" },
-                description: "List of reviewer logins to request",
-              },
-            },
-            required: ["title", "head", "base"],
+      },
+      {
+        name: "convertToDraft",
+        description:
+          "Convert a pull request back to a draft (GraphQL convertPullRequestToDraft)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            pull_number: PULL_NUMBER_SCHEMA,
           },
+          required: ["pull_number"],
         },
-        {
-          name: "publishDraftPullRequest",
-          description:
-            "Mark a draft pull request as ready for review (GraphQL markPullRequestReadyForReview)",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              pull_number: PULL_NUMBER_SCHEMA,
-            },
-            required: ["pull_number"],
+      },
+      {
+        name: "getPullRequest",
+        description:
+          "Get details for a specific pull request, including review_decision (APPROVED / CHANGES_REQUESTED / REVIEW_REQUIRED / null) and merge_state_status from GraphQL. review_decision reflects only APPROVED/CHANGES_REQUESTED reviews — a COMMENTED review (e.g. a bot re-review posting a finding) leaves it null; use getPullRequestReviews to see every review submission's state and body.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            pull_number: PULL_NUMBER_SCHEMA,
           },
+          required: ["pull_number"],
         },
-        {
-          name: "convertToDraft",
-          description:
-            "Convert a pull request back to a draft (GraphQL convertPullRequestToDraft)",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              pull_number: PULL_NUMBER_SCHEMA,
-            },
-            required: ["pull_number"],
+      },
+      {
+        name: "getPullRequestReviews",
+        description:
+          "List every submitted review on a pull request (Approve / Request changes / Comment / Dismissed / Pending). Each review returns id, author, state (APPROVED / CHANGES_REQUESTED / COMMENTED / DISMISSED / PENDING), body, submitted_at, and commit_id (the head SHA the review covered). This is the ONLY tool that surfaces COMMENTED reviews — a reviewer or bot who submits \"Comment\" rather than Approve/Request-changes does not move review_decision and is invisible to getPullRequestComments. Use this to catch blocking findings posted in a review body.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            pull_number: PULL_NUMBER_SCHEMA,
+            ...PAGINATION_BASE_SCHEMA,
+            all: PAGINATION_ALL_SCHEMA,
           },
+          required: ["pull_number"],
         },
-        {
-          name: "getPullRequest",
-          description:
-            "Get details for a specific pull request, including review_decision (APPROVED / CHANGES_REQUESTED / REVIEW_REQUIRED / null) and merge_state_status from GraphQL. review_decision reflects only APPROVED/CHANGES_REQUESTED reviews — a COMMENTED review (e.g. a bot re-review posting a finding) leaves it null; use getPullRequestReviews to see every review submission's state and body.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              pull_number: PULL_NUMBER_SCHEMA,
+      },
+      {
+        name: "updatePullRequest",
+        description:
+          "Update a pull request's title, body, or base branch",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            pull_number: PULL_NUMBER_SCHEMA,
+            title: { type: "string", description: "New pull request title" },
+            body: {
+              type: "string",
+              description: "New pull request description",
             },
-            required: ["pull_number"],
+            base: { type: "string", description: "New base branch name" },
           },
+          required: ["pull_number"],
         },
-        {
-          name: "getPullRequestReviews",
-          description:
-            "List every submitted review on a pull request (Approve / Request changes / Comment / Dismissed / Pending). Each review returns id, author, state (APPROVED / CHANGES_REQUESTED / COMMENTED / DISMISSED / PENDING), body, submitted_at, and commit_id (the head SHA the review covered). This is the ONLY tool that surfaces COMMENTED reviews — a reviewer or bot who submits \"Comment\" rather than Approve/Request-changes does not move review_decision and is invisible to getPullRequestComments. Use this to catch blocking findings posted in a review body.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              pull_number: PULL_NUMBER_SCHEMA,
-              ...PAGINATION_BASE_SCHEMA,
-              all: PAGINATION_ALL_SCHEMA,
+      },
+      {
+        name: "mergePullRequest",
+        description: "Merge a pull request",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            pull_number: PULL_NUMBER_SCHEMA,
+            merge_method: {
+              type: "string",
+              enum: ["merge", "squash", "rebase"],
+              description: "Merge method (defaults to merge)",
             },
-            required: ["pull_number"],
-          },
-        },
-        {
-          name: "updatePullRequest",
-          description:
-            "Update a pull request's title, body, or base branch",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              pull_number: PULL_NUMBER_SCHEMA,
-              title: { type: "string", description: "New pull request title" },
-              body: {
-                type: "string",
-                description: "New pull request description",
-              },
-              base: { type: "string", description: "New base branch name" },
+            commit_title: {
+              type: "string",
+              description: "Title for the merge commit",
             },
-            required: ["pull_number"],
-          },
-        },
-        {
-          name: "mergePullRequest",
-          description: "Merge a pull request",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              pull_number: PULL_NUMBER_SCHEMA,
-              merge_method: {
-                type: "string",
-                enum: ["merge", "squash", "rebase"],
-                description: "Merge method (defaults to merge)",
-              },
-              commit_title: {
-                type: "string",
-                description: "Title for the merge commit",
-              },
-              commit_message: {
-                type: "string",
-                description: "Message body for the merge commit",
-              },
-            },
-            required: ["pull_number"],
-          },
-        },
-        {
-          name: "closePullRequest",
-          description:
-            "Close a pull request without merging (GitHub's analog of declining). Optionally posts a closing comment first.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              pull_number: PULL_NUMBER_SCHEMA,
-              message: {
-                type: "string",
-                description:
-                  "Optional comment posted on the PR before closing it",
-              },
-            },
-            required: ["pull_number"],
-          },
-        },
-        {
-          name: "approvePullRequest",
-          description:
-            "Approve a pull request by submitting an APPROVE review. An existing empty pending review is submitted as the approval; a pending review with draft content must be submitted (submitPullRequestReview) or discarded (deletePendingReview) first.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              pull_number: PULL_NUMBER_SCHEMA,
-              body: {
-                type: "string",
-                description: "Optional review body to include with the approval",
-              },
-            },
-            required: ["pull_number"],
-          },
-        },
-        {
-          name: "unapprovePullRequest",
-          description:
-            "Remove the authenticated user's approval by dismissing their most recent APPROVED review",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              pull_number: PULL_NUMBER_SCHEMA,
-              message: {
-                type: "string",
-                description:
-                  "Dismissal message (defaults to 'Approval withdrawn')",
-              },
-            },
-            required: ["pull_number"],
-          },
-        },
-        {
-          name: "createPullRequestReview",
-          description:
-            "Create a pull request review, optionally with multiple inline comments, published as ONE review (a single notification) instead of separate immediate comments. With `event` set the review is published in one shot; with `event` omitted the review is created PENDING (a draft, invisible to everyone else) for later submitPullRequestReview.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              pull_number: PULL_NUMBER_SCHEMA,
-              body: {
-                type: "string",
-                description:
-                  "Optional overall review summary (required by GitHub when event is COMMENT or REQUEST_CHANGES)",
-              },
-              event: {
-                type: "string",
-                enum: ["COMMENT", "APPROVE", "REQUEST_CHANGES"],
-                description:
-                  "Review action. When omitted, the review is created PENDING and must be submitted later with submitPullRequestReview.",
-              },
-              commit_id: {
-                type: "string",
-                description:
-                  "Commit SHA to anchor the review to (defaults to the PR head)",
-              },
-              comments: {
-                type: "array",
-                description:
-                  "Inline comments to include in the review, each anchored to a diff line",
-                items: {
-                  type: "object",
-                  properties: {
-                    path: {
-                      type: "string",
-                      description: "File path the comment applies to",
-                    },
-                    body: {
-                      type: "string",
-                      description: "Comment text (markdown)",
-                    },
-                    line: {
-                      type: "number",
-                      description:
-                        "Line number in the diff (the end of the range for multi-line comments)",
-                    },
-                    side: {
-                      type: "string",
-                      enum: ["LEFT", "RIGHT"],
-                      description:
-                        "LEFT for deletions (old file), RIGHT for additions/context (new file). Defaults to RIGHT.",
-                    },
-                    start_line: {
-                      type: "number",
-                      description:
-                        "Multi-line mode: first line of the range (must be <= line)",
-                    },
-                    start_side: {
-                      type: "string",
-                      enum: ["LEFT", "RIGHT"],
-                      description: "Multi-line mode: side of start_line",
-                    },
-                  },
-                  required: ["path", "body", "line"],
-                },
-              },
-            },
-            required: ["pull_number"],
-          },
-        },
-        {
-          name: "getPendingReview",
-          description:
-            "Get the authenticated user's pending (draft) review on a pull request, including its draft comments. Pending reviews are visible only to the account that owns them, so when that account differs from the one used in the browser this tool is the only way to inspect drafts before submitting.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              pull_number: PULL_NUMBER_SCHEMA,
-            },
-            required: ["pull_number"],
-          },
-        },
-        {
-          name: "addCommentToPendingReview",
-          description:
-            "Add a single draft comment to the authenticated user's existing pending review (GraphQL addPullRequestReviewThread). Two modes: new inline thread (body + path + line) or a reply to an existing review comment thread (body + in_reply_to). Fails if no pending review exists; start one with createPullRequestReview (omit event).",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              pull_number: PULL_NUMBER_SCHEMA,
-              body: { type: "string", description: "Comment text (markdown)" },
-              path: {
-                type: "string",
-                description: "Inline mode: file path the comment applies to",
-              },
-              line: {
-                type: "number",
-                description:
-                  "Inline mode: line number in the diff (the end of the range for multi-line comments)",
-              },
-              side: {
-                type: "string",
-                enum: ["LEFT", "RIGHT"],
-                description:
-                  "Inline mode: LEFT for deletions (old file), RIGHT for additions/context (new file). Defaults to RIGHT.",
-              },
-              start_line: {
-                type: "number",
-                description:
-                  "Inline multi-line mode: first line of the range (must be <= line)",
-              },
-              start_side: {
-                type: "string",
-                enum: ["LEFT", "RIGHT"],
-                description: "Inline multi-line mode: side of start_line",
-              },
-              in_reply_to: {
-                type: "number",
-                description:
-                  "Reply mode: id of an existing review comment; the draft reply is added to that comment's thread",
-              },
-            },
-            required: ["pull_number", "body"],
-          },
-        },
-        {
-          name: "submitPullRequestReview",
-          description:
-            "Submit (publish) a pending review, sending all of its draft comments as one review with a single notification. When review_id is omitted, the authenticated user's pending review on the PR is resolved automatically.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              pull_number: PULL_NUMBER_SCHEMA,
-              event: {
-                type: "string",
-                enum: ["COMMENT", "APPROVE", "REQUEST_CHANGES"],
-                description: "Review action to publish the pending review as",
-              },
-              body: {
-                type: "string",
-                description:
-                  "Optional overall review summary (required by GitHub when event is COMMENT or REQUEST_CHANGES)",
-              },
-              review_id: {
-                type: "number",
-                description:
-                  "Pending review id (defaults to the authenticated user's pending review on the PR)",
-              },
-            },
-            required: ["pull_number", "event"],
-          },
-        },
-        {
-          name: "deletePendingReview",
-          description:
-            "Discard a pending (draft) review and its draft comments without publishing anything. Only works on PENDING reviews; GitHub rejects deleting submitted ones. When review_id is omitted, the authenticated user's pending review on the PR is resolved automatically.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              pull_number: PULL_NUMBER_SCHEMA,
-              review_id: {
-                type: "number",
-                description:
-                  "Pending review id (defaults to the authenticated user's pending review on the PR)",
-              },
-            },
-            required: ["pull_number"],
-          },
-        },
-        {
-          name: "getPendingReviewPRs",
-          description:
-            "List open pull requests where the given user (defaults to the authenticated user) is requested as a reviewer. Uses the search API (`is:pr is:open review-requested:`). Optionally scoped to an owner or an explicit repository list.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              owner: {
-                type: "string",
-                description:
-                  "Optional organization/user scope (defaults to GITHUB_OWNER; pass an empty string to search across all of GitHub)",
-              },
-              reviewer: {
-                type: "string",
-                description:
-                  "Reviewer login (defaults to @me, the authenticated user)",
-              },
-              repositoryList: {
-                type: "array",
-                items: { type: "string" },
-                description:
-                  "Optional list of repositories to check (bare names use the resolved owner; `owner/name` works too)",
-              },
-              limit: {
-                type: "number",
-                description: "Maximum number of PRs to return (default 50)",
-              },
+            commit_message: {
+              type: "string",
+              description: "Message body for the merge commit",
             },
           },
+          required: ["pull_number"],
         },
-        {
-          name: "getPullRequestActivity",
-          description:
-            "Get the timeline of events for a pull request (reviews, commits, labels, etc.)",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              pull_number: PULL_NUMBER_SCHEMA,
-              ...PAGINATION_BASE_SCHEMA,
-              all: PAGINATION_ALL_SCHEMA,
-            },
-            required: ["pull_number"],
-          },
-        },
-        {
-          name: "getPullRequestComments",
-          description:
-            "Get all comments on a pull request: top-level conversation (issue) comments plus inline review comments grouped into threads. Each comment includes is_minimized and minimized_reason (e.g. \"OUTDATED\"/\"RESOLVED\", null when visible). Each review thread includes is_resolved and is_outdated. NOTE: this returns only issue-comments and inline review threads — it does NOT return review submissions (Approve / Request changes / Comment). A COMMENTED review's body (e.g. a bot re-review finding) is invisible here; use getPullRequestReviews for review states and bodies.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              pull_number: PULL_NUMBER_SCHEMA,
-            },
-            required: ["pull_number"],
-          },
-        },
-        {
-          name: "getPullRequestComment",
-          description:
-            "Get a single PR comment by id. Tries review (inline) comments first, then issue (top-level) comments; pass comment_type to skip detection.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              comment_id: {
-                type: "number",
-                description: "Comment id",
-              },
-              comment_type: {
-                type: "string",
-                enum: ["review", "issue"],
-                description:
-                  "Comment kind: review (inline) or issue (top-level). Auto-detected when omitted.",
-              },
-            },
-            required: ["comment_id"],
-          },
-        },
-        {
-          name: "addPullRequestComment",
-          description:
-            "Add a comment to a pull request. Three modes: top-level conversation comment (body only), inline review comment on a diff line (body + path + line), or a reply to an existing review comment thread (body + in_reply_to).",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              pull_number: PULL_NUMBER_SCHEMA,
-              body: { type: "string", description: "Comment text (markdown)" },
-              path: {
-                type: "string",
-                description:
-                  "Inline mode: file path the comment applies to",
-              },
-              line: {
-                type: "number",
-                description:
-                  "Inline mode: line number in the diff the comment applies to (the end of the range for multi-line comments)",
-              },
-              side: {
-                type: "string",
-                enum: ["LEFT", "RIGHT"],
-                description:
-                  "Inline mode: LEFT for deletions (old file), RIGHT for additions/context (new file). Defaults to RIGHT.",
-              },
-              start_line: {
-                type: "number",
-                description:
-                  "Inline multi-line mode: first line of the range (must be <= line)",
-              },
-              start_side: {
-                type: "string",
-                enum: ["LEFT", "RIGHT"],
-                description: "Inline multi-line mode: side of start_line",
-              },
-              in_reply_to: {
-                type: "number",
-                description:
-                  "Reply mode: id of the review comment being replied to",
-              },
-              commit_id: {
-                type: "string",
-                description:
-                  "Inline mode: commit SHA to anchor the comment to (defaults to the PR head)",
-              },
-            },
-            required: ["pull_number", "body"],
-          },
-        },
-        {
-          name: "updatePullRequestComment",
-          description:
-            "Update the text of a PR comment (review or issue comment; auto-detected unless comment_type is passed)",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              comment_id: { type: "number", description: "Comment id" },
-              body: { type: "string", description: "New comment text" },
-              comment_type: {
-                type: "string",
-                enum: ["review", "issue"],
-                description:
-                  "Comment kind: review (inline) or issue (top-level). Auto-detected when omitted.",
-              },
-            },
-            required: ["comment_id", "body"],
-          },
-        },
-        {
-          name: "deletePullRequestComment",
-          description:
-            "Delete a PR comment (review or issue comment; auto-detected unless comment_type is passed)",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              comment_id: { type: "number", description: "Comment id" },
-              comment_type: {
-                type: "string",
-                enum: ["review", "issue"],
-                description:
-                  "Comment kind: review (inline) or issue (top-level). Auto-detected when omitted.",
-              },
-            },
-            required: ["comment_id"],
-          },
-        },
-        {
-          name: "resolveComment",
-          description:
-            "Resolve the review thread containing the given review comment (GraphQL resolveReviewThread)",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              pull_number: PULL_NUMBER_SCHEMA,
-              comment_id: {
-                type: "number",
-                description: "Id of any review comment in the thread",
-              },
-            },
-            required: ["pull_number", "comment_id"],
-          },
-        },
-        {
-          name: "reopenComment",
-          description:
-            "Unresolve the review thread containing the given review comment (GraphQL unresolveReviewThread)",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              pull_number: PULL_NUMBER_SCHEMA,
-              comment_id: {
-                type: "number",
-                description: "Id of any review comment in the thread",
-              },
-            },
-            required: ["pull_number", "comment_id"],
-          },
-        },
-        {
-          name: "minimizePullRequestComment",
-          description:
-            "Minimize (collapse/hide) a comment with a classification reason, matching the web UI 'Hide' action (GraphQL minimizeComment). Works on conversation/issue comments and PR review comments; the numeric id is auto-resolved to its node id. Known GitHub limitation: the comment is correctly hidden and the reason is recorded (queryable as minimizedReason), but the collapsed label always renders generically (\"This comment has been minimized\") instead of the specific reason (\"...marked as outdated\") — GitHub's API lowercases the classifier internally and its label renderer only matches the upper-cased form. Open bug since 2022: https://github.com/orgs/community/discussions/19865",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              comment_id: {
-                type: "number",
-                description:
-                  "Numeric comment id (issue/conversation or PR review comment). Auto-resolved to a GraphQL node id.",
-              },
-              comment_type: {
-                type: "string",
-                enum: ["review", "issue"],
-                description:
-                  "Comment kind: review (inline) or issue (top-level/conversation). Auto-detected when omitted.",
-              },
-              reason: {
-                type: "string",
-                enum: [...MINIMIZE_REASONS],
-                description:
-                  "Classification reason (ReportedContentClassifiers). Case-insensitive. Defaults to OUTDATED.",
-              },
-              node_id: {
-                type: "string",
-                description:
-                  "GraphQL node id to minimize directly, bypassing numeric-id resolution.",
-              },
-            },
-            required: [],
-          },
-        },
-        {
-          name: "unminimizePullRequestComment",
-          description:
-            "Unminimize (un-collapse) a previously minimized comment (GraphQL unminimizeComment). Works on conversation/issue comments and PR review comments; the numeric id is auto-resolved to its node id.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              comment_id: {
-                type: "number",
-                description:
-                  "Numeric comment id (issue/conversation or PR review comment). Auto-resolved to a GraphQL node id.",
-              },
-              comment_type: {
-                type: "string",
-                enum: ["review", "issue"],
-                description:
-                  "Comment kind: review (inline) or issue (top-level/conversation). Auto-detected when omitted.",
-              },
-              node_id: {
-                type: "string",
-                description:
-                  "GraphQL node id to unminimize directly, bypassing numeric-id resolution.",
-              },
-            },
-            required: [],
-          },
-        },
-        {
-          name: "checkPrReplies",
-          description:
-            "Check PR comment threads for replies. Default (self) mode finds threads where the given user has commented and someone else replied after their last comment. `all` mode returns every thread that has at least one reply. Each returned thread carries is_resolved (null for the issue-comment pseudo-thread) and the latest comment's latest_comment_is_minimized / latest_comment_minimized_reason. Identity defaults to the authenticated user's login.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              pull_numbers: {
-                type: "array",
-                items: { type: "number" },
-                description: "Pull request numbers to check",
-              },
-              self: {
-                type: "string",
-                description:
-                  "GitHub login to treat as 'self' (defaults to the authenticated user)",
-              },
-              all: {
-                type: "boolean",
-                description:
-                  "Return all threads with replies instead of only those with new replies to self",
-              },
-            },
-            required: ["pull_numbers"],
-          },
-        },
-        {
-          name: "getIssue",
-          description:
-            "Get an Issue by number (state, title, body, author, labels, milestone, assignees, comment count, timestamps). Issue equivalent of getPullRequest.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              issue_number: ISSUE_NUMBER_SCHEMA,
-            },
-            required: ["issue_number"],
-          },
-        },
-        {
-          name: "getIssueActivity",
-          description:
-            "Get the timeline of events for an Issue (comments, label changes, state changes, mentions, etc.). Issue equivalent of getPullRequestActivity. Backed by the same /issues/{n}/timeline endpoint — useful as a 'doorbell' wake for in-session babysitting watchers.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              issue_number: ISSUE_NUMBER_SCHEMA,
-              ...PAGINATION_BASE_SCHEMA,
-              all: PAGINATION_ALL_SCHEMA,
-            },
-            required: ["issue_number"],
-          },
-        },
-        {
-          name: "getIssueComments",
-          description:
-            "List top-level comments on an Issue. Each comment carries is_minimized / minimized_reason (via GraphQL when available). Supports a `since` ISO timestamp cursor — GitHub's REST API filters server-side.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              issue_number: ISSUE_NUMBER_SCHEMA,
-              since: {
-                type: "string",
-                description:
-                  "ISO 8601 timestamp; return only comments updated at or after this time.",
-              },
-              ...PAGINATION_BASE_SCHEMA,
-              all: PAGINATION_ALL_SCHEMA,
-            },
-            required: ["issue_number"],
-          },
-        },
-        {
-          name: "getIssueComment",
-          description:
-            "Get a single Issue comment by id. Backed by the issues/comments REST endpoint (the same shape used by PR top-level conversation comments).",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              comment_id: { type: "number", description: "Comment id" },
-            },
-            required: ["comment_id"],
-          },
-        },
-        {
-          name: "addIssueComment",
-          description:
-            "Post a top-level comment on an Issue. Issue equivalent of addPullRequestComment's top-level mode — Issues have no inline/reply analog.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              issue_number: ISSUE_NUMBER_SCHEMA,
-              body: { type: "string", description: "Comment text (markdown)" },
-            },
-            required: ["issue_number", "body"],
-          },
-        },
-        {
-          name: "updateIssueComment",
-          description:
-            "Update the text of an Issue comment. Issue equivalent of updatePullRequestComment.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              comment_id: { type: "number", description: "Comment id" },
-              body: { type: "string", description: "New comment text" },
-            },
-            required: ["comment_id", "body"],
-          },
-        },
-        {
-          name: "deleteIssueComment",
-          description:
-            "Delete an Issue comment. Issue equivalent of deletePullRequestComment.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              comment_id: { type: "number", description: "Comment id" },
-            },
-            required: ["comment_id"],
-          },
-        },
-        {
-          name: "checkIssueReplies",
-          description:
-            "Check Issue comment threads for replies. Default (self) mode finds Issues where the given user has commented and someone else replied after their last comment. `all` mode returns every Issue that has at least one reply after the OP. Issues have no native review-thread concept, so each Issue is treated as a single discussion thread; is_resolved is always null. Identity defaults to the authenticated user's login.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              issue_numbers: {
-                type: "array",
-                items: { type: "number" },
-                description: "Issue numbers to check",
-              },
-              self: {
-                type: "string",
-                description:
-                  "GitHub login to treat as 'self' (defaults to the authenticated user)",
-              },
-              all: {
-                type: "boolean",
-                description:
-                  "Return all Issues with replies instead of only those with new replies to self",
-              },
-            },
-            required: ["issue_numbers"],
-          },
-        },
-        {
-          name: "getCommentReactions",
-          description:
-            "List reactions on a single comment. `kind` says which endpoint to hit — `issue` for Issue conversation comments AND PR top-level conversation comments (they share the issues/comments table); `pr_review` for PR inline review comments. When `kind` is omitted, tries `issue` first then `pr_review`.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              comment_id: { type: "number", description: "Comment id" },
-              kind: {
-                type: "string",
-                enum: [...COMMENT_REACTION_KINDS],
-                description:
-                  "Comment kind: 'issue' (Issue or PR top-level conversation comment) or 'pr_review' (PR inline review comment). Auto-detected when omitted.",
-              },
-              content: {
-                type: "string",
-                enum: [...REACTION_CONTENTS],
-                description: "Optional filter: only return reactions of this content.",
-              },
-              ...PAGINATION_BASE_SCHEMA,
-              all: PAGINATION_ALL_SCHEMA,
-            },
-            required: ["comment_id"],
-          },
-        },
-        {
-          name: "getIssueReactions",
-          description:
-            "List reactions on the body of an Issue (the OP, not its comments).",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              issue_number: ISSUE_NUMBER_SCHEMA,
-              content: {
-                type: "string",
-                enum: [...REACTION_CONTENTS],
-                description: "Optional filter: only return reactions of this content.",
-              },
-              ...PAGINATION_BASE_SCHEMA,
-              all: PAGINATION_ALL_SCHEMA,
-            },
-            required: ["issue_number"],
-          },
-        },
-        {
-          name: "getPullRequestReactions",
-          description:
-            "List reactions on the body of a Pull Request (the OP, not its comments). Backed by the issues/{n}/reactions endpoint (PR bodies live in the issues table on GitHub).",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              pull_number: PULL_NUMBER_SCHEMA,
-              content: {
-                type: "string",
-                enum: [...REACTION_CONTENTS],
-                description: "Optional filter: only return reactions of this content.",
-              },
-              ...PAGINATION_BASE_SCHEMA,
-              all: PAGINATION_ALL_SCHEMA,
-            },
-            required: ["pull_number"],
-          },
-        },
-        {
-          name: "addCommentReaction",
-          description:
-            "Add a reaction to a comment. `kind` follows the same split as getCommentReactions (issue vs pr_review); auto-detected when omitted. `content` is one of: +1, -1, laugh, confused, heart, hooray, rocket, eyes. Idempotent — GitHub returns the existing reaction if the authenticated user already reacted with that content.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              comment_id: { type: "number", description: "Comment id" },
-              content: {
-                type: "string",
-                enum: [...REACTION_CONTENTS],
-                description: "Reaction content",
-              },
-              kind: {
-                type: "string",
-                enum: [...COMMENT_REACTION_KINDS],
-                description:
-                  "Comment kind: 'issue' (Issue or PR top-level conversation comment) or 'pr_review' (PR inline review comment). Auto-detected when omitted.",
-              },
-            },
-            required: ["comment_id", "content"],
-          },
-        },
-        {
-          name: "removeCommentReaction",
-          description:
-            "Remove the authenticated user's reaction of the given content from a comment. `kind` follows the same split as getCommentReactions (issue vs pr_review); auto-detected when omitted.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              comment_id: { type: "number", description: "Comment id" },
-              content: {
-                type: "string",
-                enum: [...REACTION_CONTENTS],
-                description: "Reaction content to remove",
-              },
-              kind: {
-                type: "string",
-                enum: [...COMMENT_REACTION_KINDS],
-                description:
-                  "Comment kind: 'issue' (Issue or PR top-level conversation comment) or 'pr_review' (PR inline review comment). Auto-detected when omitted.",
-              },
-            },
-            required: ["comment_id", "content"],
-          },
-        },
-        {
-          name: "getPullRequestTasks",
-          description:
-            "List PR tasks. GitHub has no native PR task object; tasks are emulated as a markdown checklist in a dedicated, marker-tagged PR comment.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              pull_number: PULL_NUMBER_SCHEMA,
-            },
-            required: ["pull_number"],
-          },
-        },
-        {
-          name: "createPullRequestTask",
-          description:
-            "Create a PR task (appends a checklist item to the managed tasks comment, creating the comment if needed)",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              pull_number: PULL_NUMBER_SCHEMA,
-              content: { type: "string", description: "Task text" },
-              state: {
-                type: "string",
-                enum: ["OPEN", "RESOLVED"],
-                description: "Initial task state (defaults to OPEN)",
-              },
-            },
-            required: ["pull_number", "content"],
-          },
-        },
-        {
-          name: "getPullRequestTask",
-          description: "Get a single PR task by id (1-based checklist position)",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              pull_number: PULL_NUMBER_SCHEMA,
-              task_id: { type: "number", description: "Task id" },
-            },
-            required: ["pull_number", "task_id"],
-          },
-        },
-        {
-          name: "updatePullRequestTask",
-          description:
-            "Update a PR task's content and/or state (OPEN/RESOLVED toggles the checkbox)",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              pull_number: PULL_NUMBER_SCHEMA,
-              task_id: { type: "number", description: "Task id" },
-              content: { type: "string", description: "New task text" },
-              state: {
-                type: "string",
-                enum: ["OPEN", "RESOLVED"],
-                description: "New task state",
-              },
-            },
-            required: ["pull_number", "task_id"],
-          },
-        },
-        {
-          name: "deletePullRequestTask",
-          description:
-            "Delete a PR task from the managed checklist comment. Task ids after the deleted one are renumbered.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              pull_number: PULL_NUMBER_SCHEMA,
-              task_id: { type: "number", description: "Task id" },
-            },
-            required: ["pull_number", "task_id"],
-          },
-        },
-        {
-          name: "getPullRequestDiff",
-          description: "Get the unified diff for a pull request",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              pull_number: PULL_NUMBER_SCHEMA,
-            },
-            required: ["pull_number"],
-          },
-        },
-        {
-          name: "getPullRequestPatch",
-          description: "Get the patch (git format-patch style) for a pull request",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              pull_number: PULL_NUMBER_SCHEMA,
-            },
-            required: ["pull_number"],
-          },
-        },
-        {
-          name: "getPullRequestDiffStat",
-          description:
-            "Get per-file change statistics for a pull request (filename, status, additions, deletions)",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              pull_number: PULL_NUMBER_SCHEMA,
-              ...PAGINATION_BASE_SCHEMA,
-              all: PAGINATION_ALL_SCHEMA,
-            },
-            required: ["pull_number"],
-          },
-        },
-        {
-          name: "getPullRequestDiffChunks",
-          description:
-            "Get the diff hunk map for a pull request: each changed file mapped to its hunks (old/new start lines and counts). Useful for placing inline comments. Optionally filtered to one path.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              pull_number: PULL_NUMBER_SCHEMA,
-              path: {
-                type: "string",
-                description: "Optional path filter (exact or suffix match)",
-              },
-            },
-            required: ["pull_number"],
-          },
-        },
-        {
-          name: "getPullRequestCommits",
-          description: "List the commits on a pull request",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              pull_number: PULL_NUMBER_SCHEMA,
-              ...PAGINATION_BASE_SCHEMA,
-              all: PAGINATION_ALL_SCHEMA,
-            },
-            required: ["pull_number"],
-          },
-        },
-        {
-          name: "getPullRequestStatuses",
-          description:
-            "Get CI state for a pull request's head commit: the combined commit status plus check runs (GitHub Actions and other check suites)",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              pull_number: PULL_NUMBER_SCHEMA,
-            },
-            required: ["pull_number"],
-          },
-        },
-        {
-          name: "listWorkflows",
-          description: "List GitHub Actions workflows defined in a repository",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              ...PAGINATION_BASE_SCHEMA,
-              all: PAGINATION_ALL_SCHEMA,
+      },
+      {
+        name: "closePullRequest",
+        description:
+          "Close a pull request without merging (GitHub's analog of declining). Optionally posts a closing comment first.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            pull_number: PULL_NUMBER_SCHEMA,
+            message: {
+              type: "string",
+              description:
+                "Optional comment posted on the PR before closing it",
             },
           },
+          required: ["pull_number"],
         },
-        {
-          name: "listWorkflowRuns",
-          description:
-            "List GitHub Actions workflow runs for a repository, optionally filtered by workflow, branch, status, event, or actor",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              workflow_id: {
-                type: "string",
-                description:
-                  "Optional workflow id or file name (e.g. ci.yml) to scope runs to one workflow",
-              },
-              branch: {
-                type: "string",
-                description: "Filter runs by head branch",
-              },
-              status: {
-                type: "string",
-                enum: [
-                  "queued",
-                  "in_progress",
-                  "completed",
-                  "success",
-                  "failure",
-                  "cancelled",
-                  "timed_out",
-                  "action_required",
-                  "neutral",
-                  "skipped",
-                  "stale",
-                  "requested",
-                  "waiting",
-                  "pending",
-                ],
-                description: "Filter runs by status or conclusion",
-              },
-              event: {
-                type: "string",
-                description:
-                  "Filter runs by trigger event (e.g. push, pull_request, workflow_dispatch, schedule)",
-              },
-              actor: {
-                type: "string",
-                description: "Filter runs by the login that triggered them",
-              },
-              ...PAGINATION_BASE_SCHEMA,
-              all: PAGINATION_ALL_SCHEMA,
+      },
+      {
+        name: "approvePullRequest",
+        description:
+          "Approve a pull request by submitting an APPROVE review. An existing empty pending review is submitted as the approval; a pending review with draft content must be submitted (submitPullRequestReview) or discarded (deletePendingReview) first.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            pull_number: PULL_NUMBER_SCHEMA,
+            body: {
+              type: "string",
+              description: "Optional review body to include with the approval",
             },
           },
+          required: ["pull_number"],
         },
-        {
-          name: "getWorkflowRun",
-          description: "Get details for a single GitHub Actions workflow run",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              run_id: { type: "number", description: "Workflow run id" },
+      },
+      {
+        name: "unapprovePullRequest",
+        description:
+          "Remove the authenticated user's approval by dismissing their most recent APPROVED review",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            pull_number: PULL_NUMBER_SCHEMA,
+            message: {
+              type: "string",
+              description:
+                "Dismissal message (defaults to 'Approval withdrawn')",
             },
-            required: ["run_id"],
           },
+          required: ["pull_number"],
         },
-        {
-          name: "listWorkflowJobs",
-          description:
-            "List the jobs for a GitHub Actions workflow run (with per-step status)",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              run_id: { type: "number", description: "Workflow run id" },
-              filter: {
-                type: "string",
-                enum: ["latest", "all"],
-                description:
-                  "latest (default) returns jobs from the most recent attempt; all returns jobs from every attempt",
-              },
-              ...PAGINATION_BASE_SCHEMA,
-              all: PAGINATION_ALL_SCHEMA,
+      },
+      {
+        name: "createPullRequestReview",
+        description:
+          "Create a pull request review, optionally with multiple inline comments, published as ONE review (a single notification) instead of separate immediate comments. With `event` set the review is published in one shot; with `event` omitted the review is created PENDING (a draft, invisible to everyone else) for later submitPullRequestReview.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            pull_number: PULL_NUMBER_SCHEMA,
+            body: {
+              type: "string",
+              description:
+                "Optional overall review summary (required by GitHub when event is COMMENT or REQUEST_CHANGES)",
             },
-            required: ["run_id"],
-          },
-        },
-        {
-          name: "getWorkflowJob",
-          description: "Get details for a single GitHub Actions job",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              job_id: { type: "number", description: "Job id" },
+            event: {
+              type: "string",
+              enum: ["COMMENT", "APPROVE", "REQUEST_CHANGES"],
+              description:
+                "Review action. When omitted, the review is created PENDING and must be submitted later with submitPullRequestReview.",
             },
-            required: ["job_id"],
-          },
-        },
-        {
-          name: "getWorkflowJobLogs",
-          description:
-            "Get the plain-text logs for a GitHub Actions job, with truncation and filtering controls (max_lines, tail, errors_only, search_term) and an option to save the full log to a temporary file.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              job_id: { type: "number", description: "Job id" },
-              max_lines: {
-                type: "number",
-                description:
-                  "Maximum number of lines to return (default 500, cap 5000)",
-              },
-              tail: {
-                type: "boolean",
-                description:
-                  "Return the last lines instead of the first lines",
-              },
-              errors_only: {
-                type: "boolean",
-                description:
-                  "Only return lines matching common error patterns (error, failed, exception, ...)",
-              },
-              search_term: {
-                type: "string",
-                description:
-                  "Only return lines containing this term (case-insensitive)",
-              },
-              save_to_file: {
-                type: "boolean",
-                description:
-                  "Save the full, unfiltered log to a temporary file and include its path in the response",
-              },
+            commit_id: {
+              type: "string",
+              description:
+                "Commit SHA to anchor the review to (defaults to the PR head)",
             },
-            required: ["job_id"],
-          },
-        },
-        {
-          name: "runWorkflow",
-          description:
-            "Trigger a workflow_dispatch event for a workflow (requires the workflow to declare `on: workflow_dispatch` and the token to have the workflow scope)",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              workflow_id: {
-                type: "string",
-                description: "Workflow id or file name (e.g. ci.yml)",
-              },
-              ref: {
-                type: "string",
-                description:
-                  "Git ref (branch or tag) to run the workflow on",
-              },
-              inputs: {
+            comments: {
+              type: "array",
+              description:
+                "Inline comments to include in the review, each anchored to a diff line",
+              items: {
                 type: "object",
-                description:
-                  "Optional workflow_dispatch inputs as key/value pairs",
-              },
-            },
-            required: ["workflow_id", "ref"],
-          },
-        },
-        {
-          name: "cancelWorkflowRun",
-          description: "Cancel an in-progress GitHub Actions workflow run",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              run_id: { type: "number", description: "Workflow run id" },
-            },
-            required: ["run_id"],
-          },
-        },
-        {
-          name: "getBranchProtection",
-          description:
-            "Get the branch protection rules for a branch (defaults to the repository's default branch)",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              branch: {
-                type: "string",
-                description:
-                  "Branch name (defaults to the repository default branch)",
-              },
-            },
-          },
-        },
-        {
-          name: "getCodeowners",
-          description:
-            "Fetch and parse the repository's CODEOWNERS file (checked in .github/, the repo root, then docs/). GitHub's closest analog to Bitbucket's effective default reviewers.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              ref: {
-                type: "string",
-                description:
-                  "Git ref to read CODEOWNERS from (defaults to the default branch)",
+                properties: {
+                  path: {
+                    type: "string",
+                    description: "File path the comment applies to",
+                  },
+                  body: {
+                    type: "string",
+                    description: "Comment text (markdown)",
+                  },
+                  line: {
+                    type: "number",
+                    description:
+                      "Line number in the diff (the end of the range for multi-line comments)",
+                  },
+                  side: {
+                    type: "string",
+                    enum: ["LEFT", "RIGHT"],
+                    description:
+                      "LEFT for deletions (old file), RIGHT for additions/context (new file). Defaults to RIGHT.",
+                  },
+                  start_line: {
+                    type: "number",
+                    description:
+                      "Multi-line mode: first line of the range (must be <= line)",
+                  },
+                  start_side: {
+                    type: "string",
+                    enum: ["LEFT", "RIGHT"],
+                    description: "Multi-line mode: side of start_line",
+                  },
+                },
+                required: ["path", "body", "line"],
               },
             },
           },
+          required: ["pull_number"],
         },
-        {
-          name: "getLatestRelease",
-          description:
-            "Get the latest published, non-draft, non-prerelease release. Returns the same shape as getRelease. Convenience wrapper for the common babysit case (`have I seen this tag yet?`). 404s when the repository has no published releases.",
-          inputSchema: {
-            type: "object",
-            properties: { ...OWNER_REPO_SCHEMA },
+      },
+      {
+        name: "getPendingReview",
+        description:
+          "Get the authenticated user's pending (draft) review on a pull request, including its draft comments. Pending reviews are visible only to the account that owns them, so when that account differs from the one used in the browser this tool is the only way to inspect drafts before submitting.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            pull_number: PULL_NUMBER_SCHEMA,
           },
+          required: ["pull_number"],
         },
-        {
-          name: "getRelease",
-          description:
-            "Get a release by its tag name (e.g. `v0.3.0`). Returns id, tag_name, name, body, draft, prerelease, published_at, html_url, author, tarball_url, zipball_url, and an assets[] array each with download metadata.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              tag: {
-                type: "string",
-                description: "Release tag name (e.g. `v0.3.0`)",
-              },
+      },
+      {
+        name: "addCommentToPendingReview",
+        description:
+          "Add a single draft comment to the authenticated user's existing pending review (GraphQL addPullRequestReviewThread). Two modes: new inline thread (body + path + line) or a reply to an existing review comment thread (body + in_reply_to). Fails if no pending review exists; start one with createPullRequestReview (omit event).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            pull_number: PULL_NUMBER_SCHEMA,
+            body: { type: "string", description: "Comment text (markdown)" },
+            path: {
+              type: "string",
+              description: "Inline mode: file path the comment applies to",
             },
-            required: ["tag"],
-          },
-        },
-        {
-          name: "getReleaseById",
-          description:
-            "Get a release by its numeric id. Use this when you already have the release id (e.g. from listReleases) and want to skip the tag lookup. Draft releases are visible only with a token that has write access.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              release_id: {
-                type: "number",
-                description: "Numeric release id",
-              },
+            line: {
+              type: "number",
+              description:
+                "Inline mode: line number in the diff (the end of the range for multi-line comments)",
             },
-            required: ["release_id"],
-          },
-        },
-        {
-          name: "listReleases",
-          description:
-            "List releases for a repository (newest first, GitHub's default order). Includes drafts and prereleases. Same pagination contract as the other list-shaped tools (per_page / page / all).",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              ...PAGINATION_BASE_SCHEMA,
-              all: PAGINATION_ALL_SCHEMA,
+            side: {
+              type: "string",
+              enum: ["LEFT", "RIGHT"],
+              description:
+                "Inline mode: LEFT for deletions (old file), RIGHT for additions/context (new file). Defaults to RIGHT.",
+            },
+            start_line: {
+              type: "number",
+              description:
+                "Inline multi-line mode: first line of the range (must be <= line)",
+            },
+            start_side: {
+              type: "string",
+              enum: ["LEFT", "RIGHT"],
+              description: "Inline multi-line mode: side of start_line",
+            },
+            in_reply_to: {
+              type: "number",
+              description:
+                "Reply mode: id of an existing review comment; the draft reply is added to that comment's thread",
             },
           },
+          required: ["pull_number", "body"],
         },
-        {
-          name: "downloadReleaseAsset",
-          description:
-            "Download a single release asset to a local path. Streams the response (does not buffer the whole file) and follows GitHub's redirect chain to the signed CDN URL. Sets `Accept: application/octet-stream` per the GitHub docs. `target_path` is resolved as: absolute paths used as-is, `~/...` expanded to the user's home, and relative paths resolved against the MCP server's working directory (`process.cwd()`). Fails if the target already exists unless `overwrite: true` is set. Callers are responsible for chmod (the file is written with the default umask). Returns { bytes_written, sha256, content_type, target_path, asset: {id, name, size} }.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              asset_id: {
-                type: "number",
-                description: "Numeric asset id (from listReleases / getRelease assets[])",
-              },
-              target_path: {
-                type: "string",
-                description:
-                  "Where to write the file. Absolute, `~/...`, or relative to the MCP server's cwd.",
-              },
-              overwrite: {
-                type: "boolean",
-                description:
-                  "When true, overwrite an existing file at target_path. Defaults to false (the call fails if the file exists).",
-              },
+      },
+      {
+        name: "submitPullRequestReview",
+        description:
+          "Submit (publish) a pending review, sending all of its draft comments as one review with a single notification. When review_id is omitted, the authenticated user's pending review on the PR is resolved automatically.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            pull_number: PULL_NUMBER_SCHEMA,
+            event: {
+              type: "string",
+              enum: ["COMMENT", "APPROVE", "REQUEST_CHANGES"],
+              description: "Review action to publish the pending review as",
             },
-            required: ["asset_id", "target_path"],
+            body: {
+              type: "string",
+              description:
+                "Optional overall review summary (required by GitHub when event is COMMENT or REQUEST_CHANGES)",
+            },
+            review_id: {
+              type: "number",
+              description:
+                "Pending review id (defaults to the authenticated user's pending review on the PR)",
+            },
+          },
+          required: ["pull_number", "event"],
+        },
+      },
+      {
+        name: "deletePendingReview",
+        description:
+          "Discard a pending (draft) review and its draft comments without publishing anything. Only works on PENDING reviews; GitHub rejects deleting submitted ones. When review_id is omitted, the authenticated user's pending review on the PR is resolved automatically.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            pull_number: PULL_NUMBER_SCHEMA,
+            review_id: {
+              type: "number",
+              description:
+                "Pending review id (defaults to the authenticated user's pending review on the PR)",
+            },
+          },
+          required: ["pull_number"],
+        },
+      },
+      {
+        name: "getPendingReviewPRs",
+        description:
+          "List open pull requests where the given user (defaults to the authenticated user) is requested as a reviewer. Uses the search API (`is:pr is:open review-requested:`). Optionally scoped to an owner or an explicit repository list.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            owner: {
+              type: "string",
+              description:
+                "Optional organization/user scope (defaults to GITHUB_OWNER; pass an empty string to search across all of GitHub)",
+            },
+            reviewer: {
+              type: "string",
+              description:
+                "Reviewer login (defaults to @me, the authenticated user)",
+            },
+            repositoryList: {
+              type: "array",
+              items: { type: "string" },
+              description:
+                "Optional list of repositories to check (bare names use the resolved owner; `owner/name` works too)",
+            },
+            limit: {
+              type: "number",
+              description: "Maximum number of PRs to return (default 50)",
+            },
           },
         },
-        {
-          name: "downloadReleaseAssets",
-          description:
-            "Download multiple assets from a release into a directory. Convenient for releases that ship per-platform artifacts when you only want one. `release_id_or_tag` accepts a numeric id, an all-digits string, or a tag name (e.g. `v0.3.0`). `pattern` is a shell-style glob (`*macos-arm64*`) or `/regex/flags` literal applied to each asset name; when omitted, every asset is downloaded. Streams each asset (no full-file buffering), follows the CDN redirect, and writes into `target_dir` using the asset name. Fails per file if the target exists unless `overwrite: true`. `target_dir` resolves like `downloadReleaseAsset`'s target_path; the directory is created if missing. Returns { downloads: [...], skipped_no_match: [...] }.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              ...OWNER_REPO_SCHEMA,
-              release_id_or_tag: {
-                type: ["string", "number"],
-                description:
-                  "Numeric release id or tag name (e.g. `v0.3.0`). All-digit strings are treated as ids.",
-              },
-              target_dir: {
-                type: "string",
-                description:
-                  "Directory to download assets into. Absolute, `~/...`, or relative to the MCP server's cwd. Created if missing.",
-              },
-              pattern: {
-                type: "string",
-                description:
-                  "Optional glob (`*macos-arm64*`) or `/regex/flags` literal matched against the asset name. Omit to download every asset.",
-              },
-              overwrite: {
-                type: "boolean",
-                description:
-                  "When true, overwrite existing files. Defaults to false (a download fails for that file if it already exists).",
-              },
+      },
+      {
+        name: "getPullRequestActivity",
+        description:
+          "Get the timeline of events for a pull request (reviews, commits, labels, etc.)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            pull_number: PULL_NUMBER_SCHEMA,
+            ...PAGINATION_BASE_SCHEMA,
+            all: PAGINATION_ALL_SCHEMA,
+          },
+          required: ["pull_number"],
+        },
+      },
+      {
+        name: "getPullRequestComments",
+        description:
+          "Get all comments on a pull request: top-level conversation (issue) comments plus inline review comments grouped into threads. Each comment includes is_minimized and minimized_reason (e.g. \"OUTDATED\"/\"RESOLVED\", null when visible). Each review thread includes is_resolved and is_outdated. NOTE: this returns only issue-comments and inline review threads — it does NOT return review submissions (Approve / Request changes / Comment). A COMMENTED review's body (e.g. a bot re-review finding) is invisible here; use getPullRequestReviews for review states and bodies.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            pull_number: PULL_NUMBER_SCHEMA,
+          },
+          required: ["pull_number"],
+        },
+      },
+      {
+        name: "getPullRequestComment",
+        description:
+          "Get a single PR comment by id. Tries review (inline) comments first, then issue (top-level) comments; pass comment_type to skip detection.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            comment_id: {
+              type: "number",
+              description: "Comment id",
             },
-            required: ["release_id_or_tag", "target_dir"],
+            comment_type: {
+              type: "string",
+              enum: ["review", "issue"],
+              description:
+                "Comment kind: review (inline) or issue (top-level). Auto-detected when omitted.",
+            },
+          },
+          required: ["comment_id"],
+        },
+      },
+      {
+        name: "addPullRequestComment",
+        description:
+          "Add a comment to a pull request. Three modes: top-level conversation comment (body only), inline review comment on a diff line (body + path + line), or a reply to an existing review comment thread (body + in_reply_to).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            pull_number: PULL_NUMBER_SCHEMA,
+            body: { type: "string", description: "Comment text (markdown)" },
+            path: {
+              type: "string",
+              description:
+                "Inline mode: file path the comment applies to",
+            },
+            line: {
+              type: "number",
+              description:
+                "Inline mode: line number in the diff the comment applies to (the end of the range for multi-line comments)",
+            },
+            side: {
+              type: "string",
+              enum: ["LEFT", "RIGHT"],
+              description:
+                "Inline mode: LEFT for deletions (old file), RIGHT for additions/context (new file). Defaults to RIGHT.",
+            },
+            start_line: {
+              type: "number",
+              description:
+                "Inline multi-line mode: first line of the range (must be <= line)",
+            },
+            start_side: {
+              type: "string",
+              enum: ["LEFT", "RIGHT"],
+              description: "Inline multi-line mode: side of start_line",
+            },
+            in_reply_to: {
+              type: "number",
+              description:
+                "Reply mode: id of the review comment being replied to",
+            },
+            commit_id: {
+              type: "string",
+              description:
+                "Inline mode: commit SHA to anchor the comment to (defaults to the PR head)",
+            },
+          },
+          required: ["pull_number", "body"],
+        },
+      },
+      {
+        name: "updatePullRequestComment",
+        description:
+          "Update the text of a PR comment (review or issue comment; auto-detected unless comment_type is passed)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            comment_id: { type: "number", description: "Comment id" },
+            body: { type: "string", description: "New comment text" },
+            comment_type: {
+              type: "string",
+              enum: ["review", "issue"],
+              description:
+                "Comment kind: review (inline) or issue (top-level). Auto-detected when omitted.",
+            },
+          },
+          required: ["comment_id", "body"],
+        },
+      },
+      {
+        name: "deletePullRequestComment",
+        description:
+          "Delete a PR comment (review or issue comment; auto-detected unless comment_type is passed)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            comment_id: { type: "number", description: "Comment id" },
+            comment_type: {
+              type: "string",
+              enum: ["review", "issue"],
+              description:
+                "Comment kind: review (inline) or issue (top-level). Auto-detected when omitted.",
+            },
+          },
+          required: ["comment_id"],
+        },
+      },
+      {
+        name: "resolveComment",
+        description:
+          "Resolve the review thread containing the given review comment (GraphQL resolveReviewThread)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            pull_number: PULL_NUMBER_SCHEMA,
+            comment_id: {
+              type: "number",
+              description: "Id of any review comment in the thread",
+            },
+          },
+          required: ["pull_number", "comment_id"],
+        },
+      },
+      {
+        name: "reopenComment",
+        description:
+          "Unresolve the review thread containing the given review comment (GraphQL unresolveReviewThread)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            pull_number: PULL_NUMBER_SCHEMA,
+            comment_id: {
+              type: "number",
+              description: "Id of any review comment in the thread",
+            },
+          },
+          required: ["pull_number", "comment_id"],
+        },
+      },
+      {
+        name: "minimizePullRequestComment",
+        description:
+          "Minimize (collapse/hide) a comment with a classification reason, matching the web UI 'Hide' action (GraphQL minimizeComment). Works on conversation/issue comments and PR review comments; the numeric id is auto-resolved to its node id. Known GitHub limitation: the comment is correctly hidden and the reason is recorded (queryable as minimizedReason), but the collapsed label always renders generically (\"This comment has been minimized\") instead of the specific reason (\"...marked as outdated\") — GitHub's API lowercases the classifier internally and its label renderer only matches the upper-cased form. Open bug since 2022: https://github.com/orgs/community/discussions/19865",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            comment_id: {
+              type: "number",
+              description:
+                "Numeric comment id (issue/conversation or PR review comment). Auto-resolved to a GraphQL node id.",
+            },
+            comment_type: {
+              type: "string",
+              enum: ["review", "issue"],
+              description:
+                "Comment kind: review (inline) or issue (top-level/conversation). Auto-detected when omitted.",
+            },
+            reason: {
+              type: "string",
+              enum: [...MINIMIZE_REASONS],
+              description:
+                "Classification reason (ReportedContentClassifiers). Case-insensitive. Defaults to OUTDATED.",
+            },
+            node_id: {
+              type: "string",
+              description:
+                "GraphQL node id to minimize directly, bypassing numeric-id resolution.",
+            },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "unminimizePullRequestComment",
+        description:
+          "Unminimize (un-collapse) a previously minimized comment (GraphQL unminimizeComment). Works on conversation/issue comments and PR review comments; the numeric id is auto-resolved to its node id.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            comment_id: {
+              type: "number",
+              description:
+                "Numeric comment id (issue/conversation or PR review comment). Auto-resolved to a GraphQL node id.",
+            },
+            comment_type: {
+              type: "string",
+              enum: ["review", "issue"],
+              description:
+                "Comment kind: review (inline) or issue (top-level/conversation). Auto-detected when omitted.",
+            },
+            node_id: {
+              type: "string",
+              description:
+                "GraphQL node id to unminimize directly, bypassing numeric-id resolution.",
+            },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "checkPrReplies",
+        description:
+          "Check PR comment threads for replies. Default (self) mode finds threads where the given user has commented and someone else replied after their last comment. `all` mode returns every thread that has at least one reply. Each returned thread carries is_resolved (null for the issue-comment pseudo-thread) and the latest comment's latest_comment_is_minimized / latest_comment_minimized_reason. Identity defaults to the authenticated user's login.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            pull_numbers: {
+              type: "array",
+              items: { type: "number" },
+              description: "Pull request numbers to check",
+            },
+            self: {
+              type: "string",
+              description:
+                "GitHub login to treat as 'self' (defaults to the authenticated user)",
+            },
+            all: {
+              type: "boolean",
+              description:
+                "Return all threads with replies instead of only those with new replies to self",
+            },
+          },
+          required: ["pull_numbers"],
+        },
+      },
+      {
+        name: "getIssue",
+        description:
+          "Get an Issue by number (state, title, body, author, labels, milestone, assignees, comment count, timestamps). Issue equivalent of getPullRequest.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            issue_number: ISSUE_NUMBER_SCHEMA,
+          },
+          required: ["issue_number"],
+        },
+      },
+      {
+        name: "getIssueActivity",
+        description:
+          "Get the timeline of events for an Issue (comments, label changes, state changes, mentions, etc.). Issue equivalent of getPullRequestActivity. Backed by the same /issues/{n}/timeline endpoint — useful as a 'doorbell' wake for in-session babysitting watchers.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            issue_number: ISSUE_NUMBER_SCHEMA,
+            ...PAGINATION_BASE_SCHEMA,
+            all: PAGINATION_ALL_SCHEMA,
+          },
+          required: ["issue_number"],
+        },
+      },
+      {
+        name: "getIssueComments",
+        description:
+          "List top-level comments on an Issue. Each comment carries is_minimized / minimized_reason (via GraphQL when available). Supports a `since` ISO timestamp cursor — GitHub's REST API filters server-side.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            issue_number: ISSUE_NUMBER_SCHEMA,
+            since: {
+              type: "string",
+              description:
+                "ISO 8601 timestamp; return only comments updated at or after this time.",
+            },
+            ...PAGINATION_BASE_SCHEMA,
+            all: PAGINATION_ALL_SCHEMA,
+          },
+          required: ["issue_number"],
+        },
+      },
+      {
+        name: "getIssueComment",
+        description:
+          "Get a single Issue comment by id. Backed by the issues/comments REST endpoint (the same shape used by PR top-level conversation comments).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            comment_id: { type: "number", description: "Comment id" },
+          },
+          required: ["comment_id"],
+        },
+      },
+      {
+        name: "addIssueComment",
+        description:
+          "Post a top-level comment on an Issue. Issue equivalent of addPullRequestComment's top-level mode — Issues have no inline/reply analog.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            issue_number: ISSUE_NUMBER_SCHEMA,
+            body: { type: "string", description: "Comment text (markdown)" },
+          },
+          required: ["issue_number", "body"],
+        },
+      },
+      {
+        name: "updateIssueComment",
+        description:
+          "Update the text of an Issue comment. Issue equivalent of updatePullRequestComment.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            comment_id: { type: "number", description: "Comment id" },
+            body: { type: "string", description: "New comment text" },
+          },
+          required: ["comment_id", "body"],
+        },
+      },
+      {
+        name: "deleteIssueComment",
+        description:
+          "Delete an Issue comment. Issue equivalent of deletePullRequestComment.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            comment_id: { type: "number", description: "Comment id" },
+          },
+          required: ["comment_id"],
+        },
+      },
+      {
+        name: "checkIssueReplies",
+        description:
+          "Check Issue comment threads for replies. Default (self) mode finds Issues where the given user has commented and someone else replied after their last comment. `all` mode returns every Issue that has at least one reply after the OP. Issues have no native review-thread concept, so each Issue is treated as a single discussion thread; is_resolved is always null. Identity defaults to the authenticated user's login.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            issue_numbers: {
+              type: "array",
+              items: { type: "number" },
+              description: "Issue numbers to check",
+            },
+            self: {
+              type: "string",
+              description:
+                "GitHub login to treat as 'self' (defaults to the authenticated user)",
+            },
+            all: {
+              type: "boolean",
+              description:
+                "Return all Issues with replies instead of only those with new replies to self",
+            },
+          },
+          required: ["issue_numbers"],
+        },
+      },
+      {
+        name: "getCommentReactions",
+        description:
+          "List reactions on a single comment. `kind` says which endpoint to hit — `issue` for Issue conversation comments AND PR top-level conversation comments (they share the issues/comments table); `pr_review` for PR inline review comments. When `kind` is omitted, tries `issue` first then `pr_review`.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            comment_id: { type: "number", description: "Comment id" },
+            kind: {
+              type: "string",
+              enum: [...COMMENT_REACTION_KINDS],
+              description:
+                "Comment kind: 'issue' (Issue or PR top-level conversation comment) or 'pr_review' (PR inline review comment). Auto-detected when omitted.",
+            },
+            content: {
+              type: "string",
+              enum: [...REACTION_CONTENTS],
+              description: "Optional filter: only return reactions of this content.",
+            },
+            ...PAGINATION_BASE_SCHEMA,
+            all: PAGINATION_ALL_SCHEMA,
+          },
+          required: ["comment_id"],
+        },
+      },
+      {
+        name: "getIssueReactions",
+        description:
+          "List reactions on the body of an Issue (the OP, not its comments).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            issue_number: ISSUE_NUMBER_SCHEMA,
+            content: {
+              type: "string",
+              enum: [...REACTION_CONTENTS],
+              description: "Optional filter: only return reactions of this content.",
+            },
+            ...PAGINATION_BASE_SCHEMA,
+            all: PAGINATION_ALL_SCHEMA,
+          },
+          required: ["issue_number"],
+        },
+      },
+      {
+        name: "getPullRequestReactions",
+        description:
+          "List reactions on the body of a Pull Request (the OP, not its comments). Backed by the issues/{n}/reactions endpoint (PR bodies live in the issues table on GitHub).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            pull_number: PULL_NUMBER_SCHEMA,
+            content: {
+              type: "string",
+              enum: [...REACTION_CONTENTS],
+              description: "Optional filter: only return reactions of this content.",
+            },
+            ...PAGINATION_BASE_SCHEMA,
+            all: PAGINATION_ALL_SCHEMA,
+          },
+          required: ["pull_number"],
+        },
+      },
+      {
+        name: "addCommentReaction",
+        description:
+          "Add a reaction to a comment. `kind` follows the same split as getCommentReactions (issue vs pr_review); auto-detected when omitted. `content` is one of: +1, -1, laugh, confused, heart, hooray, rocket, eyes. Idempotent — GitHub returns the existing reaction if the authenticated user already reacted with that content.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            comment_id: { type: "number", description: "Comment id" },
+            content: {
+              type: "string",
+              enum: [...REACTION_CONTENTS],
+              description: "Reaction content",
+            },
+            kind: {
+              type: "string",
+              enum: [...COMMENT_REACTION_KINDS],
+              description:
+                "Comment kind: 'issue' (Issue or PR top-level conversation comment) or 'pr_review' (PR inline review comment). Auto-detected when omitted.",
+            },
+          },
+          required: ["comment_id", "content"],
+        },
+      },
+      {
+        name: "removeCommentReaction",
+        description:
+          "Remove the authenticated user's reaction of the given content from a comment. `kind` follows the same split as getCommentReactions (issue vs pr_review); auto-detected when omitted.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            comment_id: { type: "number", description: "Comment id" },
+            content: {
+              type: "string",
+              enum: [...REACTION_CONTENTS],
+              description: "Reaction content to remove",
+            },
+            kind: {
+              type: "string",
+              enum: [...COMMENT_REACTION_KINDS],
+              description:
+                "Comment kind: 'issue' (Issue or PR top-level conversation comment) or 'pr_review' (PR inline review comment). Auto-detected when omitted.",
+            },
+          },
+          required: ["comment_id", "content"],
+        },
+      },
+      {
+        name: "getPullRequestTasks",
+        description:
+          "List PR tasks. GitHub has no native PR task object; tasks are emulated as a markdown checklist in a dedicated, marker-tagged PR comment.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            pull_number: PULL_NUMBER_SCHEMA,
+          },
+          required: ["pull_number"],
+        },
+      },
+      {
+        name: "createPullRequestTask",
+        description:
+          "Create a PR task (appends a checklist item to the managed tasks comment, creating the comment if needed)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            pull_number: PULL_NUMBER_SCHEMA,
+            content: { type: "string", description: "Task text" },
+            state: {
+              type: "string",
+              enum: ["OPEN", "RESOLVED"],
+              description: "Initial task state (defaults to OPEN)",
+            },
+          },
+          required: ["pull_number", "content"],
+        },
+      },
+      {
+        name: "getPullRequestTask",
+        description: "Get a single PR task by id (1-based checklist position)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            pull_number: PULL_NUMBER_SCHEMA,
+            task_id: { type: "number", description: "Task id" },
+          },
+          required: ["pull_number", "task_id"],
+        },
+      },
+      {
+        name: "updatePullRequestTask",
+        description:
+          "Update a PR task's content and/or state (OPEN/RESOLVED toggles the checkbox)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            pull_number: PULL_NUMBER_SCHEMA,
+            task_id: { type: "number", description: "Task id" },
+            content: { type: "string", description: "New task text" },
+            state: {
+              type: "string",
+              enum: ["OPEN", "RESOLVED"],
+              description: "New task state",
+            },
+          },
+          required: ["pull_number", "task_id"],
+        },
+      },
+      {
+        name: "deletePullRequestTask",
+        description:
+          "Delete a PR task from the managed checklist comment. Task ids after the deleted one are renumbered.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            pull_number: PULL_NUMBER_SCHEMA,
+            task_id: { type: "number", description: "Task id" },
+          },
+          required: ["pull_number", "task_id"],
+        },
+      },
+      {
+        name: "getPullRequestDiff",
+        description: "Get the unified diff for a pull request",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            pull_number: PULL_NUMBER_SCHEMA,
+          },
+          required: ["pull_number"],
+        },
+      },
+      {
+        name: "getPullRequestPatch",
+        description: "Get the patch (git format-patch style) for a pull request",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            pull_number: PULL_NUMBER_SCHEMA,
+          },
+          required: ["pull_number"],
+        },
+      },
+      {
+        name: "getPullRequestDiffStat",
+        description:
+          "Get per-file change statistics for a pull request (filename, status, additions, deletions)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            pull_number: PULL_NUMBER_SCHEMA,
+            ...PAGINATION_BASE_SCHEMA,
+            all: PAGINATION_ALL_SCHEMA,
+          },
+          required: ["pull_number"],
+        },
+      },
+      {
+        name: "getPullRequestDiffChunks",
+        description:
+          "Get the diff hunk map for a pull request: each changed file mapped to its hunks (old/new start lines and counts). Useful for placing inline comments. Optionally filtered to one path.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            pull_number: PULL_NUMBER_SCHEMA,
+            path: {
+              type: "string",
+              description: "Optional path filter (exact or suffix match)",
+            },
+          },
+          required: ["pull_number"],
+        },
+      },
+      {
+        name: "getPullRequestCommits",
+        description: "List the commits on a pull request",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            pull_number: PULL_NUMBER_SCHEMA,
+            ...PAGINATION_BASE_SCHEMA,
+            all: PAGINATION_ALL_SCHEMA,
+          },
+          required: ["pull_number"],
+        },
+      },
+      {
+        name: "getPullRequestStatuses",
+        description:
+          "Get CI state for a pull request's head commit: the combined commit status plus check runs (GitHub Actions and other check suites)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            pull_number: PULL_NUMBER_SCHEMA,
+          },
+          required: ["pull_number"],
+        },
+      },
+      {
+        name: "listWorkflows",
+        description: "List GitHub Actions workflows defined in a repository",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            ...PAGINATION_BASE_SCHEMA,
+            all: PAGINATION_ALL_SCHEMA,
           },
         },
-      ].filter(
-        (tool) =>
-          this.config.allowDangerousCommands === true ||
-          !this.isDangerousTool(tool.name)
-      ),
+      },
+      {
+        name: "listWorkflowRuns",
+        description:
+          "List GitHub Actions workflow runs for a repository, optionally filtered by workflow, branch, status, event, or actor",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            workflow_id: {
+              type: "string",
+              description:
+                "Optional workflow id or file name (e.g. ci.yml) to scope runs to one workflow",
+            },
+            branch: {
+              type: "string",
+              description: "Filter runs by head branch",
+            },
+            status: {
+              type: "string",
+              enum: [
+                "queued",
+                "in_progress",
+                "completed",
+                "success",
+                "failure",
+                "cancelled",
+                "timed_out",
+                "action_required",
+                "neutral",
+                "skipped",
+                "stale",
+                "requested",
+                "waiting",
+                "pending",
+              ],
+              description: "Filter runs by status or conclusion",
+            },
+            event: {
+              type: "string",
+              description:
+                "Filter runs by trigger event (e.g. push, pull_request, workflow_dispatch, schedule)",
+            },
+            actor: {
+              type: "string",
+              description: "Filter runs by the login that triggered them",
+            },
+            ...PAGINATION_BASE_SCHEMA,
+            all: PAGINATION_ALL_SCHEMA,
+          },
+        },
+      },
+      {
+        name: "getWorkflowRun",
+        description: "Get details for a single GitHub Actions workflow run",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            run_id: { type: "number", description: "Workflow run id" },
+          },
+          required: ["run_id"],
+        },
+      },
+      {
+        name: "listWorkflowJobs",
+        description:
+          "List the jobs for a GitHub Actions workflow run (with per-step status)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            run_id: { type: "number", description: "Workflow run id" },
+            filter: {
+              type: "string",
+              enum: ["latest", "all"],
+              description:
+                "latest (default) returns jobs from the most recent attempt; all returns jobs from every attempt",
+            },
+            ...PAGINATION_BASE_SCHEMA,
+            all: PAGINATION_ALL_SCHEMA,
+          },
+          required: ["run_id"],
+        },
+      },
+      {
+        name: "getWorkflowJob",
+        description: "Get details for a single GitHub Actions job",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            job_id: { type: "number", description: "Job id" },
+          },
+          required: ["job_id"],
+        },
+      },
+      {
+        name: "getWorkflowJobLogs",
+        description:
+          "Get the plain-text logs for a GitHub Actions job, with truncation and filtering controls (max_lines, tail, errors_only, search_term) and an option to save the full log to a temporary file.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            job_id: { type: "number", description: "Job id" },
+            max_lines: {
+              type: "number",
+              description:
+                "Maximum number of lines to return (default 500, cap 5000)",
+            },
+            tail: {
+              type: "boolean",
+              description:
+                "Return the last lines instead of the first lines",
+            },
+            errors_only: {
+              type: "boolean",
+              description:
+                "Only return lines matching common error patterns (error, failed, exception, ...)",
+            },
+            search_term: {
+              type: "string",
+              description:
+                "Only return lines containing this term (case-insensitive)",
+            },
+            save_to_file: {
+              type: "boolean",
+              description:
+                "Save the full, unfiltered log to a temporary file and include its path in the response",
+            },
+          },
+          required: ["job_id"],
+        },
+      },
+      {
+        name: "runWorkflow",
+        description:
+          "Trigger a workflow_dispatch event for a workflow (requires the workflow to declare `on: workflow_dispatch` and the token to have the workflow scope)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            workflow_id: {
+              type: "string",
+              description: "Workflow id or file name (e.g. ci.yml)",
+            },
+            ref: {
+              type: "string",
+              description:
+                "Git ref (branch or tag) to run the workflow on",
+            },
+            inputs: {
+              type: "object",
+              description:
+                "Optional workflow_dispatch inputs as key/value pairs",
+            },
+          },
+          required: ["workflow_id", "ref"],
+        },
+      },
+      {
+        name: "cancelWorkflowRun",
+        description: "Cancel an in-progress GitHub Actions workflow run",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            run_id: { type: "number", description: "Workflow run id" },
+          },
+          required: ["run_id"],
+        },
+      },
+      {
+        name: "getBranchProtection",
+        description:
+          "Get the branch protection rules for a branch (defaults to the repository's default branch)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            branch: {
+              type: "string",
+              description:
+                "Branch name (defaults to the repository default branch)",
+            },
+          },
+        },
+      },
+      {
+        name: "getCodeowners",
+        description:
+          "Fetch and parse the repository's CODEOWNERS file (checked in .github/, the repo root, then docs/). GitHub's closest analog to Bitbucket's effective default reviewers.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            ref: {
+              type: "string",
+              description:
+                "Git ref to read CODEOWNERS from (defaults to the default branch)",
+            },
+          },
+        },
+      },
+      {
+        name: "getLatestRelease",
+        description:
+          "Get the latest published, non-draft, non-prerelease release. Returns the same shape as getRelease. Convenience wrapper for the common babysit case (`have I seen this tag yet?`). 404s when the repository has no published releases.",
+        inputSchema: {
+          type: "object",
+          properties: { ...OWNER_REPO_SCHEMA },
+        },
+      },
+      {
+        name: "getRelease",
+        description:
+          "Get a release by its tag name (e.g. `v0.3.0`). Returns id, tag_name, name, body, draft, prerelease, published_at, html_url, author, tarball_url, zipball_url, and an assets[] array each with download metadata.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            tag: {
+              type: "string",
+              description: "Release tag name (e.g. `v0.3.0`)",
+            },
+          },
+          required: ["tag"],
+        },
+      },
+      {
+        name: "getReleaseById",
+        description:
+          "Get a release by its numeric id. Use this when you already have the release id (e.g. from listReleases) and want to skip the tag lookup. Draft releases are visible only with a token that has write access.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            release_id: {
+              type: "number",
+              description: "Numeric release id",
+            },
+          },
+          required: ["release_id"],
+        },
+      },
+      {
+        name: "listReleases",
+        description:
+          "List releases for a repository (newest first, GitHub's default order). Includes drafts and prereleases. Same pagination contract as the other list-shaped tools (per_page / page / all).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            ...PAGINATION_BASE_SCHEMA,
+            all: PAGINATION_ALL_SCHEMA,
+          },
+        },
+      },
+      {
+        name: "downloadReleaseAsset",
+        description:
+          "Download a single release asset to a local path. Streams the response (does not buffer the whole file) and follows GitHub's redirect chain to the signed CDN URL. Sets `Accept: application/octet-stream` per the GitHub docs. `target_path` is resolved as: absolute paths used as-is, `~/...` expanded to the user's home, and relative paths resolved against the MCP server's working directory (`process.cwd()`). Fails if the target already exists unless `overwrite: true` is set. Callers are responsible for chmod (the file is written with the default umask). Returns { bytes_written, sha256, content_type, target_path, asset: {id, name, size} }.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            asset_id: {
+              type: "number",
+              description: "Numeric asset id (from listReleases / getRelease assets[])",
+            },
+            target_path: {
+              type: "string",
+              description:
+                "Where to write the file. Absolute, `~/...`, or relative to the MCP server's cwd.",
+            },
+            overwrite: {
+              type: "boolean",
+              description:
+                "When true, overwrite an existing file at target_path. Defaults to false (the call fails if the file exists).",
+            },
+          },
+          required: ["asset_id", "target_path"],
+        },
+      },
+      {
+        name: "downloadReleaseAssets",
+        description:
+          "Download multiple assets from a release into a directory. Convenient for releases that ship per-platform artifacts when you only want one. `release_id_or_tag` accepts a numeric id, an all-digits string, or a tag name (e.g. `v0.3.0`). `pattern` is a shell-style glob (`*macos-arm64*`) or `/regex/flags` literal applied to each asset name; when omitted, every asset is downloaded. Streams each asset (no full-file buffering), follows the CDN redirect, and writes into `target_dir` using the asset name. Fails per file if the target exists unless `overwrite: true`. `target_dir` resolves like `downloadReleaseAsset`'s target_path; the directory is created if missing. Returns { downloads: [...], skipped_no_match: [...] }.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            release_id_or_tag: {
+              type: ["string", "number"],
+              description:
+                "Numeric release id or tag name (e.g. `v0.3.0`). All-digit strings are treated as ids.",
+            },
+            target_dir: {
+              type: "string",
+              description:
+                "Directory to download assets into. Absolute, `~/...`, or relative to the MCP server's cwd. Created if missing.",
+            },
+            pattern: {
+              type: "string",
+              description:
+                "Optional glob (`*macos-arm64*`) or `/regex/flags` literal matched against the asset name. Omit to download every asset.",
+            },
+            overwrite: {
+              type: "boolean",
+              description:
+                "When true, overwrite existing files. Defaults to false (a download fails for that file if it already exists).",
+            },
+          },
+          required: ["release_id_or_tag", "target_dir"],
+        },
+      },
+    ].filter(
+      (tool) =>
+        this.config.allowDangerousCommands === true ||
+        !this.isDangerousTool(tool.name)
+    );
+  }
+
+  private setupToolHandlers() {
+    const tools = this.toolDefinitions();
+    const inputSchemas = new Map<string, ArgSchema>(
+      tools.map((tool) => [tool.name, tool.inputSchema as unknown as ArgSchema])
+    );
+
+    this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
+      tools,
     }));
 
     // Register the call tool handler
@@ -2271,6 +2284,17 @@ class GitHubServer {
             ErrorCode.MethodNotFound,
             `Tool ${toolName} is disabled. Set GITHUB_ENABLE_DANGEROUS=true to enable.`
           );
+        }
+
+        const inputSchema = inputSchemas.get(toolName);
+        if (inputSchema !== undefined) {
+          const argumentErrors = validateToolArguments(inputSchema, args);
+          if (argumentErrors.length > 0) {
+            throw new McpError(
+              ErrorCode.InvalidParams,
+              formatArgumentErrors(toolName, argumentErrors)
+            );
+          }
         }
 
         switch (toolName) {
