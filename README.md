@@ -5,11 +5,10 @@ built as a sibling of [bitbucket-mcp](https://github.com/MatanYemini/bitbucket-m
 the same single-server architecture, pagination model, log shaping, and tool
 vocabulary, mapped onto GitHub.
 
-Exposes 71 tools by default (72 total — `deletePullRequestTask` is gated
-behind `GITHUB_ENABLE_DANGEROUS`) covering pull requests, reviews, comments
-and threads, issues, reactions, diffs, commit statuses and check runs, GitHub
-Actions (workflows, runs, jobs, logs), releases, branch protection, and
-CODEOWNERS.
+Tools cover pull requests, reviews, comments and threads, issues, reactions,
+diffs, commit statuses and check runs, GitHub Actions (workflows, runs, jobs,
+logs), releases, branch protection, and CODEOWNERS. Destructive tools
+(`deletePullRequestTask`) stay hidden unless `GITHUB_ENABLE_DANGEROUS` is set.
 
 ## Setup
 
