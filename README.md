@@ -5,10 +5,11 @@ built as a sibling of [bitbucket-mcp](https://github.com/MatanYemini/bitbucket-m
 the same single-server architecture, pagination model, log shaping, and tool
 vocabulary, mapped onto GitHub.
 
-Exposes 48 tools by default (49 total — `deletePullRequestTask` is gated
+Exposes 71 tools by default (72 total — `deletePullRequestTask` is gated
 behind `GITHUB_ENABLE_DANGEROUS`) covering pull requests, reviews, comments
-and threads, diffs, commit statuses and check runs, GitHub Actions
-(workflows, runs, jobs, logs), branch protection, and CODEOWNERS.
+and threads, issues, reactions, diffs, commit statuses and check runs, GitHub
+Actions (workflows, runs, jobs, logs), releases, branch protection, and
+CODEOWNERS.
 
 ## Setup
 
@@ -85,7 +86,8 @@ It does **not** apply to:
   eventual review body carries the signature instead.
 - The managed PR tasks comment (`createPullRequestTask` and friends) — its
   body is machine-serialized state, round-tripped verbatim.
-- PR titles/descriptions, and merge/commit messages.
+- PR titles/descriptions, Issue titles/bodies (`createIssue` / `updateIssue`),
+  and merge/commit messages.
 - Any other tool.
 
 Appending is idempotent: if a body already ends with the signature (trimmed
@@ -160,6 +162,7 @@ and a casing variant of a real key gets a suggestion
 | `closePullRequest` | `declinePullRequest` | GitHub has no decline; closes the PR, optional closing comment |
 | `approvePullRequest` | `approvePullRequest` | Submits an `APPROVE` review |
 | `unapprovePullRequest` | `unapprovePullRequest` | Dismisses your latest `APPROVED` review |
+| `getPullRequestReviews` | — | Every submitted review (state, body, author, commit). A `COMMENTED` review does not move `reviewDecision` and appears in no comment tool |
 | `getPendingReviewPRs` | `getPendingReviewPRs` | Search API: `is:pr is:open review-requested:@me` |
 | `getPullRequestActivity` | `getPullRequestActivity` | Issue timeline events |
 
@@ -187,6 +190,8 @@ detail-on-demand) maps cleanly to Issues with the same shapes.
 | Tool | Notes |
 |------|-------|
 | `getIssue` | Issue equivalent of `getPullRequest`. Rejects when `#n` is actually a PR (GitHub's issues endpoint returns both). |
+| `createIssue` | `title` plus optional `body`, `labels`, `assignees`. Returns the Issue with its `number` and `html_url`. Labels and assignees need push access. |
+| `updateIssue` | Change `title`, `body`, `state` (`open`/`closed`), `state_reason`, `labels`, `assignees`. `labels`/`assignees` **replace** the whole set (`[]` clears it). A `state_reason` must come with its state — `completed`/`not_planned` with `closed`, `reopened` with `open` — because GitHub silently ignores a reason without a state change. Rejects PRs before editing (use `updatePullRequest` / `closePullRequest`). |
 | `getIssueActivity` | Issue equivalent of `getPullRequestActivity` (timeline events: comments, label/assignee/milestone changes, state changes). |
 | `getIssueComments` | List top-level comments. Supports server-side `since` ISO timestamp cursor. Each comment carries `is_minimized` / `minimized_reason` via GraphQL. |
 | `getIssueComment` | Single comment by id. |
@@ -376,8 +381,9 @@ npm run inspector  # MCP inspector against the built server
 
 Unit tests cover the pure helper modules (pagination, search queries, task
 checklists, log filtering, diff chunking, thread building, CODEOWNERS
-parsing, token resolution, pending-review resolution) and run without any
-credentials or network.
+parsing, token resolution, pending-review resolution, issue request
+building, releases, reviews) plus handler wiring with Octokit stubbed, and run
+without any credentials or network.
 
 ## Architecture
 
@@ -403,6 +409,9 @@ credentials or network.
 - `src/repoMove.ts` — renamed/transferred repository handling: recognizing
   the content-length-mismatch failure GitHub's redirect causes on requests
   with a body, and caching old-slug → new-slug mappings for retries.
+- `src/issues.ts` — `createIssue` / `updateIssue` request building, refusing
+  what GitHub would reject or silently ignore (blank title, empty update,
+  `state_reason` without its matching `state`).
 - `src/releases.ts` — pure helpers for the Release tools: response shaping,
   target-path resolution (absolute vs `~`-expanded vs cwd-relative), glob /
   regex pattern matching for asset filtering, and tag-vs-id classification.

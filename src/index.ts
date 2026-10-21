@@ -74,6 +74,13 @@ import { pipeline as streamPipeline } from "stream/promises";
 import { Readable, Writable } from "stream";
 import { countReviewStates, summarizeReview } from "./reviews.js";
 import {
+  buildIssueCreate,
+  buildIssueUpdate,
+  ISSUE_STATE_REASONS,
+  IssueRequestError,
+  IssueStateReason,
+} from "./issues.js";
+import {
   ArgSchema,
   formatArgumentErrors,
   validateToolArguments,
@@ -1530,6 +1537,70 @@ class GitHubServer {
         },
       },
       {
+        name: "createIssue",
+        description:
+          "Create an Issue. Returns its number and html_url along with the trimmed Issue shape. The body is posted as given (no comment signature, matching PR descriptions).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            title: { type: "string", description: "Issue title" },
+            body: { type: "string", description: "Issue body (markdown)" },
+            labels: {
+              type: "array",
+              items: { type: "string" },
+              description:
+                "Label names to apply. Needs push access; labels that do not exist are created by GitHub.",
+            },
+            assignees: {
+              type: "array",
+              items: { type: "string" },
+              description: "Logins to assign. Needs push access.",
+            },
+          },
+          required: ["title"],
+        },
+      },
+      {
+        name: "updateIssue",
+        description:
+          "Edit an Issue: title, body, state (open/closed with an optional state_reason), labels, assignees. labels and assignees REPLACE the whole set (an empty array clears it). A state_reason must come with the state it describes: completed/not_planned with closed, reopened with open. Rejects pull requests (use updatePullRequest / closePullRequest).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            issue_number: ISSUE_NUMBER_SCHEMA,
+            title: { type: "string", description: "New title" },
+            body: {
+              type: "string",
+              description: "New body (markdown); an empty string clears it",
+            },
+            state: {
+              type: "string",
+              enum: ["open", "closed"],
+              description: "New state",
+            },
+            state_reason: {
+              type: "string",
+              enum: [...ISSUE_STATE_REASONS],
+              description:
+                "Why the state changed; requires state (completed, not_planned → closed; reopened → open)",
+            },
+            labels: {
+              type: "array",
+              items: { type: "string" },
+              description: "Replacement label set; [] removes every label",
+            },
+            assignees: {
+              type: "array",
+              items: { type: "string" },
+              description: "Replacement assignee set; [] unassigns everyone",
+            },
+          },
+          required: ["issue_number"],
+        },
+      },
+      {
         name: "getIssueActivity",
         description:
           "Get the timeline of events for an Issue (comments, label changes, state changes, mentions, etc.). Issue equivalent of getPullRequestActivity. Backed by the same /issues/{n}/timeline endpoint — useful as a 'doorbell' wake for in-session babysitting watchers.",
@@ -2570,6 +2641,29 @@ class GitHubServer {
               args.owner as string | undefined,
               args.repo as string | undefined,
               args.issue_number as number
+            );
+          case "createIssue":
+            return await this.createIssue(
+              args.owner as string | undefined,
+              args.repo as string | undefined,
+              args.title as string,
+              args.body as string | undefined,
+              args.labels as string[] | undefined,
+              args.assignees as string[] | undefined
+            );
+          case "updateIssue":
+            return await this.updateIssue(
+              args.owner as string | undefined,
+              args.repo as string | undefined,
+              args.issue_number as number,
+              {
+                title: args.title as string | undefined,
+                body: args.body as string | undefined,
+                state: args.state as "open" | "closed" | undefined,
+                state_reason: args.state_reason as IssueStateReason | undefined,
+                labels: args.labels as string[] | undefined,
+                assignees: args.assignees as string[] | undefined,
+              }
             );
           case "getIssueActivity":
             return await this.getIssueActivity(
@@ -4781,6 +4875,80 @@ class GitHubServer {
         node_id: issue.node_id,
       });
     });
+  }
+
+  async createIssue(
+    owner: string | undefined,
+    repo: string | undefined,
+    title: string,
+    body?: string,
+    labels?: string[],
+    assignees?: string[]
+  ) {
+    const ctx = this.resolveContext(owner, repo);
+    return this.guard("createIssue", { ...ctx, title }, async () => {
+      const params = this.issueParams(() =>
+        buildIssueCreate({ title, body, labels, assignees })
+      );
+      const response = await this.octokit.rest.issues.create({
+        owner: ctx.owner,
+        repo: ctx.repo,
+        ...params,
+      });
+      return this.json({
+        ...summarizeIssue(response.data),
+        body: response.data.body,
+        node_id: response.data.node_id,
+      });
+    });
+  }
+
+  async updateIssue(
+    owner: string | undefined,
+    repo: string | undefined,
+    issue_number: number,
+    fields: Parameters<typeof buildIssueUpdate>[0]
+  ) {
+    const ctx = this.resolveContext(owner, repo);
+    return this.guard("updateIssue", { ...ctx, issue_number }, async () => {
+      const params = this.issueParams(() => buildIssueUpdate(fields));
+      // The issues endpoint edits PRs too. Check first, as getIssue does: once
+      // the PATCH has gone through, refusing would be too late.
+      const existing = await this.octokit.rest.issues.get({
+        owner: ctx.owner,
+        repo: ctx.repo,
+        issue_number,
+      });
+      if (existing.data.pull_request) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `#${issue_number} is a pull request, not an Issue. Use updatePullRequest or closePullRequest instead.`
+        );
+      }
+      const response = await this.octokit.rest.issues.update({
+        owner: ctx.owner,
+        repo: ctx.repo,
+        issue_number,
+        ...params,
+      });
+      return this.json({
+        ...summarizeIssue(response.data),
+        body: response.data.body,
+        node_id: response.data.node_id,
+      });
+    });
+  }
+
+  /** Run an issues.ts builder, surfacing its refusal as InvalidParams. */
+  private issueParams<T>(build: () => T): T {
+    try {
+      return build();
+    } catch (error) {
+      if (error instanceof IssueRequestError) {
+        throw new McpError(ErrorCode.InvalidParams, error.message);
+      }
+      throw error;
+    }
   }
 
   async getIssueActivity(
