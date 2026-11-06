@@ -89,6 +89,13 @@ It does **not** apply to:
   and merge/commit messages.
 - Any other tool.
 
+Every tool in the first list also takes an optional `signature` argument that
+replaces the configured signature for that one call: a non-empty value is
+appended instead of `GITHUB_COMMENT_SIGNATURE`, and an empty string posts the
+body exactly as given. Use it when the caller signs its own posts (for example
+an agent that recognizes its comments by their last line), so the configured
+signature is not stacked under the caller's — on edits as well as creates.
+
 Appending is idempotent: if a body already ends with the signature (trimmed
 compare), it is not appended again. Leaving the variable unset or empty is a
 no-op. The signature is body text only — GitHub still attributes the comment to

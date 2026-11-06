@@ -31,20 +31,40 @@ export function getCommentSignature(
  * - Idempotent: skips appending when the body already ends with the signature
  *   (trimmed compare).
  * - Append format: existing body, two newlines, signature verbatim.
+ * - `override` is the caller's per-call `signature` argument. When given it
+ *   replaces the configured signature for this post; an empty (or
+ *   all-whitespace) override posts the body exactly as given.
+ *
+ * Why an explicit override rather than "skip when the body already ends in
+ * some signature-looking line": a caller that signs its own posts (an agent
+ * whose waker recognizes its comments by their LAST line) had the configured
+ * signature stacked under its own, which both put the account holder's name
+ * on every post and made the caller's own comments unrecognizable to it. Edits
+ * could not repair it, because every edit re-appended the line. A heuristic
+ * would also fire on a body that merely ends with a quoted signature line, so
+ * the caller states it instead.
  */
 export function applySignature(
   body: string,
-  env?: Record<string, string | undefined>
+  env?: Record<string, string | undefined>,
+  override?: string
 ): string;
 export function applySignature(
   body: string | undefined,
-  env?: Record<string, string | undefined>
+  env?: Record<string, string | undefined>,
+  override?: string
 ): string | undefined;
 export function applySignature(
   body: string | undefined,
-  env: Record<string, string | undefined> = process.env
+  env: Record<string, string | undefined> = process.env,
+  override?: string
 ): string | undefined {
-  const signature = getCommentSignature(env);
+  const signature =
+    override === undefined
+      ? getCommentSignature(env)
+      : override.trim().length > 0
+        ? override
+        : undefined;
   if (signature === undefined) {
     return body;
   }

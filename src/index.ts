@@ -200,6 +200,15 @@ const PULL_NUMBER_SCHEMA = {
   description: "Pull request number",
 };
 
+// Per-call replacement for GITHUB_COMMENT_SIGNATURE on every tool that signs
+// what it posts. See applySignature in src/signature.ts for why this is an
+// explicit argument rather than a guess from the body's last line.
+const SIGNATURE_SCHEMA = {
+  type: "string",
+  description:
+    "Signature for this post, in place of the configured GITHUB_COMMENT_SIGNATURE. Appended after two newlines unless the body already ends with it. Pass an empty string to post the body exactly as given (for a body that carries its own signature). Omit to use the configured signature.",
+};
+
 const ISSUE_NUMBER_SCHEMA = {
   type: "number",
   description: "Issue number",
@@ -1062,6 +1071,7 @@ class GitHubServer {
               description:
                 "Optional comment posted on the PR before closing it",
             },
+            signature: SIGNATURE_SCHEMA,
           },
           required: ["pull_number"],
         },
@@ -1079,6 +1089,7 @@ class GitHubServer {
               type: "string",
               description: "Optional review body to include with the approval",
             },
+            signature: SIGNATURE_SCHEMA,
           },
           required: ["pull_number"],
         },
@@ -1097,6 +1108,7 @@ class GitHubServer {
               description:
                 "Dismissal message (defaults to 'Approval withdrawn')",
             },
+            signature: SIGNATURE_SCHEMA,
           },
           required: ["pull_number"],
         },
@@ -1166,6 +1178,7 @@ class GitHubServer {
                 required: ["path", "body", "line"],
               },
             },
+            signature: SIGNATURE_SCHEMA,
           },
           required: ["pull_number"],
         },
@@ -1251,6 +1264,7 @@ class GitHubServer {
               description:
                 "Pending review id (defaults to the authenticated user's pending review on the PR)",
             },
+            signature: SIGNATURE_SCHEMA,
           },
           required: ["pull_number", "event"],
         },
@@ -1399,6 +1413,7 @@ class GitHubServer {
               description:
                 "Inline mode: commit SHA to anchor the comment to (defaults to the PR head)",
             },
+            signature: SIGNATURE_SCHEMA,
           },
           required: ["pull_number", "body"],
         },
@@ -1419,6 +1434,7 @@ class GitHubServer {
               description:
                 "Comment kind: review (inline) or issue (top-level). Auto-detected when omitted.",
             },
+            signature: SIGNATURE_SCHEMA,
           },
           required: ["comment_id", "body"],
         },
@@ -1700,6 +1716,7 @@ class GitHubServer {
             ...OWNER_REPO_SCHEMA,
             issue_number: ISSUE_NUMBER_SCHEMA,
             body: { type: "string", description: "Comment text (markdown)" },
+            signature: SIGNATURE_SCHEMA,
           },
           required: ["issue_number", "body"],
         },
@@ -1714,6 +1731,7 @@ class GitHubServer {
             ...OWNER_REPO_SCHEMA,
             comment_id: { type: "number", description: "Comment id" },
             body: { type: "string", description: "New comment text" },
+            signature: SIGNATURE_SCHEMA,
           },
           required: ["comment_id", "body"],
         },
@@ -2524,21 +2542,24 @@ class GitHubServer {
               args.owner as string | undefined,
               args.repo as string | undefined,
               args.pull_number as number,
-              args.message as string | undefined
+              args.message as string | undefined,
+              args.signature as string | undefined
             );
           case "approvePullRequest":
             return await this.approvePullRequest(
               args.owner as string | undefined,
               args.repo as string | undefined,
               args.pull_number as number,
-              args.body as string | undefined
+              args.body as string | undefined,
+              args.signature as string | undefined
             );
           case "unapprovePullRequest":
             return await this.unapprovePullRequest(
               args.owner as string | undefined,
               args.repo as string | undefined,
               args.pull_number as number,
-              args.message as string | undefined
+              args.message as string | undefined,
+              args.signature as string | undefined
             );
           case "createPullRequestReview":
             return await this.createPullRequestReview(
@@ -2552,7 +2573,8 @@ class GitHubServer {
                 | "REQUEST_CHANGES"
                 | undefined,
               args.commit_id as string | undefined,
-              args.comments as ReviewCommentDraft[] | undefined
+              args.comments as ReviewCommentDraft[] | undefined,
+              args.signature as string | undefined
             );
           case "getPendingReview":
             return await this.getPendingReview(
@@ -2582,7 +2604,8 @@ class GitHubServer {
               args.pull_number as number,
               args.event as "COMMENT" | "APPROVE" | "REQUEST_CHANGES",
               args.body as string | undefined,
-              args.review_id as number | undefined
+              args.review_id as number | undefined,
+              args.signature as string | undefined
             );
           case "deletePendingReview":
             return await this.deletePendingReview(
@@ -2634,7 +2657,8 @@ class GitHubServer {
                 start_side: args.start_side as "LEFT" | "RIGHT" | undefined,
                 in_reply_to: args.in_reply_to as number | undefined,
                 commit_id: args.commit_id as string | undefined,
-              }
+              },
+              args.signature as string | undefined
             );
           case "updatePullRequestComment":
             return await this.updatePullRequestComment(
@@ -2642,7 +2666,8 @@ class GitHubServer {
               args.repo as string | undefined,
               args.comment_id as number,
               args.body as string,
-              args.comment_type as "review" | "issue" | undefined
+              args.comment_type as "review" | "issue" | undefined,
+              args.signature as string | undefined
             );
           case "deletePullRequestComment":
             return await this.deletePullRequestComment(
@@ -2751,14 +2776,16 @@ class GitHubServer {
               args.owner as string | undefined,
               args.repo as string | undefined,
               args.issue_number as number,
-              args.body as string
+              args.body as string,
+              args.signature as string | undefined
             );
           case "updateIssueComment":
             return await this.updateIssueComment(
               args.owner as string | undefined,
               args.repo as string | undefined,
               args.comment_id as number,
-              args.body as string
+              args.body as string,
+              args.signature as string | undefined
             );
           case "deleteIssueComment":
             return await this.deleteIssueComment(
@@ -3568,7 +3595,8 @@ class GitHubServer {
     owner: string | undefined,
     repo: string | undefined,
     pull_number: number,
-    message?: string
+    message?: string,
+    signature?: string
   ) {
     const ctx = this.resolveContext(owner, repo);
     return this.guard(
@@ -3582,7 +3610,7 @@ class GitHubServer {
             owner: ctx.owner,
             repo: ctx.repo,
             issue_number: pull_number,
-            body: applySignature(message),
+            body: applySignature(message, process.env, signature),
           });
         }
         const response = await this.octokit.rest.pulls.update({
@@ -3600,12 +3628,13 @@ class GitHubServer {
     owner: string | undefined,
     repo: string | undefined,
     pull_number: number,
-    body?: string
+    body?: string,
+    signature?: string
   ) {
     const ctx = this.resolveContext(owner, repo);
     // Sign once, before dispatch, so every path (fresh review, existing
     // pending review, orphan recovery) posts the signed body.
-    body = applySignature(body);
+    body = applySignature(body, process.env, signature);
     return this.guard(
       "approvePullRequest",
       { ...ctx, pull_number },
@@ -3757,7 +3786,8 @@ class GitHubServer {
     owner: string | undefined,
     repo: string | undefined,
     pull_number: number,
-    message?: string
+    message?: string,
+    signature?: string
   ) {
     const ctx = this.resolveContext(owner, repo);
     return this.guard(
@@ -3790,7 +3820,11 @@ class GitHubServer {
           review_id: latest.id,
           // The dismissal always carries a message, so sign the resolved
           // value — the default included.
-          message: applySignature(message ?? "Approval withdrawn"),
+          message: applySignature(
+            message ?? "Approval withdrawn",
+            process.env,
+            signature
+          ),
         });
         return this.json({
           dismissed_review_id: latest.id,
@@ -3852,11 +3886,12 @@ class GitHubServer {
     body?: string,
     event?: "COMMENT" | "APPROVE" | "REQUEST_CHANGES",
     commit_id?: string,
-    comments?: ReviewCommentDraft[]
+    comments?: ReviewCommentDraft[],
+    signature?: string
   ) {
     const ctx = this.resolveContext(owner, repo);
     // Sign the top-level review summary only; never the inline comments[].
-    body = applySignature(body);
+    body = applySignature(body, process.env, signature);
     return this.guard(
       "createPullRequestReview",
       { ...ctx, pull_number, event, comment_count: comments?.length ?? 0 },
@@ -4104,10 +4139,11 @@ class GitHubServer {
     pull_number: number,
     event: "COMMENT" | "APPROVE" | "REQUEST_CHANGES",
     body?: string,
-    review_id?: number
+    review_id?: number,
+    signature?: string
   ) {
     const ctx = this.resolveContext(owner, repo);
-    body = applySignature(body);
+    body = applySignature(body, process.env, signature);
     return this.guard(
       "submitPullRequestReview",
       { ...ctx, pull_number, event, review_id },
@@ -4556,11 +4592,12 @@ class GitHubServer {
       start_side?: "LEFT" | "RIGHT";
       in_reply_to?: number;
       commit_id?: string;
-    } = {}
+    } = {},
+    signature?: string
   ) {
     const ctx = this.resolveContext(owner, repo);
     // Sign once, before mode dispatch, so every mode posts the signed body.
-    body = applySignature(body);
+    body = applySignature(body, process.env, signature);
     return this.guard(
       "addPullRequestComment",
       { ...ctx, pull_number, ...options },
@@ -4639,12 +4676,13 @@ class GitHubServer {
     repo: string | undefined,
     comment_id: number,
     body: string,
-    comment_type?: "review" | "issue"
+    comment_type?: "review" | "issue",
+    signature?: string
   ) {
     const ctx = this.resolveContext(owner, repo);
     // Sign once, before mode dispatch, so both review and issue edits post the
     // signed body — matching the create/reply paths.
-    body = applySignature(body);
+    body = applySignature(body, process.env, signature);
     return this.guard(
       "updatePullRequestComment",
       { ...ctx, comment_id, comment_type },
@@ -5288,10 +5326,11 @@ class GitHubServer {
     owner: string | undefined,
     repo: string | undefined,
     issue_number: number,
-    body: string
+    body: string,
+    signature?: string
   ) {
     const ctx = this.resolveContext(owner, repo);
-    body = applySignature(body);
+    body = applySignature(body, process.env, signature);
     return this.guard(
       "addIssueComment",
       { ...ctx, issue_number },
@@ -5311,10 +5350,11 @@ class GitHubServer {
     owner: string | undefined,
     repo: string | undefined,
     comment_id: number,
-    body: string
+    body: string,
+    signature?: string
   ) {
     const ctx = this.resolveContext(owner, repo);
-    body = applySignature(body);
+    body = applySignature(body, process.env, signature);
     return this.guard(
       "updateIssueComment",
       { ...ctx, comment_id },
