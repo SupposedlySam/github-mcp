@@ -157,6 +157,8 @@ and a casing variant of a real key gets a suggestion
 | `publishDraftPullRequest` | `publishDraftPullRequest` | GraphQL `markPullRequestReadyForReview` |
 | `convertToDraft` | `convertTodraft` | GraphQL `convertPullRequestToDraft` (name typo fixed) |
 | `updatePullRequest` | `updatePullRequest` | Also supports changing the base branch |
+| `addPullRequestLabels` | — | Additive (`POST /issues/{n}/labels`): never replaces the existing set; reports `added` vs `already_present`. Unknown names are created by GitHub. Refuses an Issue number |
+| `removePullRequestLabels` | — | One `DELETE` per label; others stay. A label not on the PR is reported as `not_present`, not an error. Refuses an Issue number |
 | `mergePullRequest` | `mergePullRequest` | `merge` / `squash` / `rebase` |
 | `closePullRequest` | `declinePullRequest` | GitHub has no decline; closes the PR, optional closing comment |
 | `approvePullRequest` | `approvePullRequest` | Submits an `APPROVE` review |
@@ -411,6 +413,8 @@ without any credentials or network.
 - `src/issues.ts` — `createIssue` / `updateIssue` request building, refusing
   what GitHub would reject or silently ignore (blank title, empty update,
   `state_reason` without its matching `state`).
+- `src/labels.ts` — label-name validation and presence checks for the
+  additive PR label tools (which never use the set-replacing endpoint).
 - `src/releases.ts` — pure helpers for the Release tools: response shaping,
   target-path resolution (absolute vs `~`-expanded vs cwd-relative), glob /
   regex pattern matching for asset filtering, and tag-vs-id classification.

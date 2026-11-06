@@ -44,6 +44,7 @@ Adding a tool means touching all three.
 - `src/pendingReview.ts` — pending-review resolution, review-comment draft validation (review batching), and approval planning around existing pending reviews
 - `src/repoMove.ts` — renamed/transferred repo handling: recognizing the content-length-mismatch failure caused by GitHub's redirect on requests with a body, plus the old-slug → new-slug move cache used to rewrite and retry such requests
 - `src/issues.ts` — `createIssue`/`updateIssue` request building: refuses a blank title, an empty update, and a `state_reason` without its matching `state` (GitHub ignores those silently)
+- `src/labels.ts` — `addPullRequestLabels`/`removePullRequestLabels` helpers: label-name validation (non-empty, no stray whitespace, case-insensitive dedupe) and presence partitioning; the tools only use the additive POST/DELETE label endpoints, never the set-replacing issue PATCH
 - `src/releases.ts` — Release tools' pure helpers: response shaping, target-path resolution (absolute / `~`-expanded / cwd-relative), glob-or-regex pattern matching, and `release_id_or_tag` classification
 
 Repetitive data processing belongs in these modules (code over compute), keeping it testable without network access.

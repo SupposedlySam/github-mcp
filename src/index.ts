@@ -81,6 +81,12 @@ import {
   IssueStateReason,
 } from "./issues.js";
 import {
+  labelNames,
+  LabelRequestError,
+  normalizeLabelNames,
+  partitionByPresence,
+} from "./labels.js";
+import {
   ArgSchema,
   formatArgumentErrors,
   validateToolArguments,
@@ -979,6 +985,42 @@ class GitHubServer {
             base: { type: "string", description: "New base branch name" },
           },
           required: ["pull_number"],
+        },
+      },
+      {
+        name: "addPullRequestLabels",
+        description:
+          "Add labels to a pull request WITHOUT replacing its existing labels (POST /issues/{n}/labels). Labels already on the PR are left as they are and reported as already_present. A name not yet defined in the repo is created by GitHub, so check the spelling. Refuses an Issue number.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            pull_number: PULL_NUMBER_SCHEMA,
+            labels: {
+              type: "array",
+              items: { type: "string" },
+              description: "Label names to add (non-empty)",
+            },
+          },
+          required: ["pull_number", "labels"],
+        },
+      },
+      {
+        name: "removePullRequestLabels",
+        description:
+          "Remove labels from a pull request, one DELETE per label, leaving every other label in place. A label that is not on the PR is reported as not_present rather than failing the call. Refuses an Issue number.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...OWNER_REPO_SCHEMA,
+            pull_number: PULL_NUMBER_SCHEMA,
+            labels: {
+              type: "array",
+              items: { type: "string" },
+              description: "Label names to remove (non-empty)",
+            },
+          },
+          required: ["pull_number", "labels"],
         },
       },
       {
@@ -2454,6 +2496,20 @@ class GitHubServer {
               args.body as string | undefined,
               args.base as string | undefined
             );
+          case "addPullRequestLabels":
+            return await this.addPullRequestLabels(
+              args.owner as string | undefined,
+              args.repo as string | undefined,
+              args.pull_number as number,
+              args.labels as string[]
+            );
+          case "removePullRequestLabels":
+            return await this.removePullRequestLabels(
+              args.owner as string | undefined,
+              args.repo as string | undefined,
+              args.pull_number as number,
+              args.labels as string[]
+            );
           case "mergePullRequest":
             return await this.mergePullRequest(
               args.owner as string | undefined,
@@ -3356,6 +3412,130 @@ class GitHubServer {
         });
       }
     );
+  }
+
+  async addPullRequestLabels(
+    owner: string | undefined,
+    repo: string | undefined,
+    pull_number: number,
+    labels: string[]
+  ) {
+    const ctx = this.resolveContext(owner, repo);
+    return this.guard(
+      "addPullRequestLabels",
+      { ...ctx, pull_number, labels },
+      async () => {
+        const names = this.labelParams(labels);
+        const current = await this.pullRequestLabels(ctx, pull_number);
+        const { present, absent } = partitionByPresence(names, current);
+        let after = current;
+        if (absent.length > 0) {
+          // Additive endpoint: never `issues.update({ labels })`, which
+          // replaces the set and strips labels other workflows applied.
+          const response = await this.octokit.rest.issues.addLabels({
+            owner: ctx.owner,
+            repo: ctx.repo,
+            issue_number: pull_number,
+            labels: absent,
+          });
+          after = labelNames(response.data);
+        }
+        return this.json({
+          pull_number,
+          added: absent,
+          already_present: present,
+          labels: after,
+        });
+      }
+    );
+  }
+
+  async removePullRequestLabels(
+    owner: string | undefined,
+    repo: string | undefined,
+    pull_number: number,
+    labels: string[]
+  ) {
+    const ctx = this.resolveContext(owner, repo);
+    return this.guard(
+      "removePullRequestLabels",
+      { ...ctx, pull_number, labels },
+      async () => {
+        const names = this.labelParams(labels);
+        const current = await this.pullRequestLabels(ctx, pull_number);
+        const { present, absent } = partitionByPresence(names, current);
+        const removed: string[] = [];
+        const notPresent = [...absent];
+        let after = current;
+        for (const name of present) {
+          try {
+            const response = await this.octokit.rest.issues.removeLabel({
+              owner: ctx.owner,
+              repo: ctx.repo,
+              issue_number: pull_number,
+              name,
+            });
+            after = labelNames(response.data);
+            removed.push(name);
+          } catch (error) {
+            // 404 here means the label went between our read and this
+            // DELETE (the PR itself was proved to exist above). Anything
+            // else is a real failure and must not read as "removed".
+            if (isRequestError(error) && error.status === 404) {
+              notPresent.push(name);
+              continue;
+            }
+            throw error;
+          }
+        }
+        if (removed.length === 0 && notPresent.length > 0) {
+          after = current.filter(
+            (n) => !notPresent.some((m) => m.toLowerCase() === n.toLowerCase())
+          );
+        }
+        return this.json({
+          pull_number,
+          removed,
+          not_present: notPresent,
+          labels: after,
+        });
+      }
+    );
+  }
+
+  /** Validate label names, surfacing a refusal as InvalidParams. */
+  private labelParams(labels: unknown): string[] {
+    try {
+      return normalizeLabelNames(labels);
+    } catch (error) {
+      if (error instanceof LabelRequestError) {
+        throw new McpError(ErrorCode.InvalidParams, error.message);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * The PR's current label names. Reads through the issues endpoint (which
+   * also answers for Issues) and refuses an Issue: the label endpoints accept
+   * either, so a mistyped number would otherwise label the wrong item.
+   */
+  private async pullRequestLabels(
+    ctx: { owner: string; repo: string },
+    pull_number: number
+  ): Promise<string[]> {
+    const existing = await this.octokit.rest.issues.get({
+      owner: ctx.owner,
+      repo: ctx.repo,
+      issue_number: pull_number,
+    });
+    if (!existing.data.pull_request) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `#${pull_number} is an Issue, not a pull request. Use updateIssue to change an Issue's labels.`
+      );
+    }
+    return labelNames(existing.data.labels);
   }
 
   async mergePullRequest(
